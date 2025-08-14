@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse
 import os
 import re
 from typing import List
@@ -22,45 +22,44 @@ def process_request(question_path, file_dict):
     else:
         answers = analyze_data_files(question, file_dict)
 
-    # Ensure answers is a list/tuple of length 4
+    # Ensure answers is list of exactly 4 items
     if not (isinstance(answers, (list, tuple)) and len(answers) == 4):
         answers = ["Task failed", "", "", DUMMY_IMAGE]
 
-    # Replace any empty image answers with dummy image
+    # Fill missing image
     if not answers[3] or answers[3] == "?":
         answers = list(answers)
         answers[3] = DUMMY_IMAGE
 
-    # Convert all answers to strings
+    # Convert to strings
     answers = [str(a) for a in answers]
 
-    # Return exactly 4 lines, joined by newline (plain text)
-    return "\n".join(answers)
+    return answers
 
-@app.post("/api/", response_class=PlainTextResponse)
-async def api_endpoint(
-    questions: UploadFile = File(...),
-    files: List[UploadFile] = File(None)
-):
+@app.post("/api/", response_class=JSONResponse)
+async def api_endpoint(files: List[UploadFile] = File(...)):
     tmp_dir = "/tmp/tds_agent"
     os.makedirs(tmp_dir, exist_ok=True)
 
-    question_path = os.path.join(tmp_dir, "questions.txt")
-    with open(question_path, "wb") as f:
-        f.write(await questions.read())
-
+    question_path = None
     file_dict = {}
-    if files:
-        for file in files:
-            file_path = os.path.join(tmp_dir, file.filename)
-            with open(file_path, "wb") as f:
-                f.write(await file.read())
+
+    for file in files:
+        file_path = os.path.join(tmp_dir, file.filename)
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        if file.filename.lower() == "questions.txt":
+            question_path = file_path
+        else:
             file_dict[file.filename] = file_path
 
+    if not question_path:
+        return JSONResponse(content=["Task failed", "", "", DUMMY_IMAGE])
+
     try:
-        response_text = process_request(question_path, file_dict)
+        answers = process_request(question_path, file_dict)
     finally:
-        # Optional: Cleanup all files after processing
         try:
             os.remove(question_path)
             for path in file_dict.values():
@@ -68,4 +67,4 @@ async def api_endpoint(
         except Exception:
             pass
 
-    return response_text
+    return JSONResponse(content=answers)
