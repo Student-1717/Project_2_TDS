@@ -7,8 +7,9 @@ import io
 import json
 import os
 
-from util import scrape_table_from_url, analyze_question, parse_questions
+from scraper import load_data_from_url, load_data_from_file  # ✅ updated import
 
+from util import analyze_question, parse_questions
 from urllib.parse import urlparse
 
 app = FastAPI(title="TDS Data Analyst Agent")
@@ -102,26 +103,28 @@ async def analyze(
         if files:
             for f in files:
                 content = await f.read()
-                if f.filename.endswith(".csv"):
-                    try:
-                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
-                    except Exception:
-                        uploaded_data[f.filename] = None
-                else:
-                    uploaded_data[f.filename] = content
+                try:
+                    uploaded_data[f.filename] = load_data_from_file(f)  # ✅ use new loader
+                except Exception:
+                    uploaded_data[f.filename] = None
 
         # Step 4: Scrape URLs & collect extra keys
         dataframes = {}
         extra_keys = set()
         for url in urls:
             try:
-                df = scrape_table_from_url(url)
-                dataframes[url] = df
-                extra_keys.update(extract_keys_from_url_data(url, df))
+                df_or_tables = load_data_from_url(url)  # ✅ new dynamic loader
+                if isinstance(df_or_tables, dict):  # multiple tables
+                    for name, df in df_or_tables.items():
+                        dataframes[f"{url}::{name}"] = df
+                        extra_keys.update(extract_keys_from_url_data(url, df))
+                else:
+                    dataframes[url] = df_or_tables
+                    extra_keys.update(extract_keys_from_url_data(url, df_or_tables))
             except Exception:
                 dataframes[url] = None
 
-        # Include uploaded CSVs
+        # Include uploaded CSV/Excel/JSON
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
