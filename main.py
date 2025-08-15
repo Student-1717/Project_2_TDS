@@ -1,6 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel  # <-- Add this import
 from typing import List, Optional
 import pandas as pd
 import io
