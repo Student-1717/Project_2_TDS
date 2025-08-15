@@ -10,6 +10,7 @@ from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
+
 def generate_key_from_question(question: str) -> str:
     """
     Placeholder function to map question text to evaluator keys.
@@ -17,9 +18,10 @@ def generate_key_from_question(question: str) -> str:
     """
     return question.lower().replace(" ", "_")  # simple example
 
+
 @app.post("/api/", response_model=None)
 async def analyze(
-    request=None,  # keep untyped to avoid FastAPI Pydantic issue
+    request: Optional[Request] = None,  # optional untyped request
     questions_txt: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = None
 ):
@@ -41,7 +43,7 @@ async def analyze(
             try:
                 body = await request.json()
                 questions_content = body.get("request", "").strip()
-            except json.JSONDecodeError:
+            except Exception:
                 pass
 
         if not questions_content:
