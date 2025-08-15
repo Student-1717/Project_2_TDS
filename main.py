@@ -1,50 +1,70 @@
+# main.py
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 import pandas as pd
 import io
 import json
+import os
 
 from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
 def generate_key_from_question(question: str) -> str:
+    """Maps question text to evaluator keys (simple, generic)."""
     return question.lower().replace(" ", "_")
 
-@app.post("/api/", response_model=None)
+@app.post("/api/")
 async def analyze(
     request: Request,
     questions_txt: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = None
 ):
+    """
+    Accepts:
+      - Multipart/form-data: questions.txt + optional CSV/image files
+      - JSON: {"request": "...questions text..."}
+    Returns:
+      - Dictionary keyed for evaluator
+    """
     try:
-        # Step 1: Read questions content
+        # Step 1: Get questions content
         questions_content = None
 
         if questions_txt:
-            # Multipart form upload of questions.txt
+            # If provided as file upload
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
         else:
             # Try reading JSON body
             try:
                 body = await request.json()
                 questions_content = body.get("request", "").strip()
-            except json.JSONDecodeError:
-                # If not JSON, try raw text
-                raw_body = (await request.body()).decode("utf-8").strip()
-                if raw_body:
-                    questions_content = raw_body
+            except Exception:
+                # If request.json() fails, maybe it's raw text (promptfoo file mode)
+                try:
+                    raw_body = await request.body()
+                    if raw_body:
+                        questions_content = raw_body.decode("utf-8").strip()
+                except Exception:
+                    pass
+
+        # Also allow file path from env or config for local eval
+        if not questions_content:
+            file_path = os.environ.get("QUESTIONS_FILE")
+            if file_path and os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    questions_content = f.read().strip()
 
         if not questions_content:
             return JSONResponse(content={"error": "No questions provided"}, status_code=200)
 
-        # Step 2: Parse questions and URLs
+        # Step 2: Parse questions & URLs
         questions, urls = parse_questions(questions_content)
         if not questions:
             return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
-        # Step 3: Handle optional uploaded files
+        # Step 3: Process uploaded files (optional)
         uploaded_data = {}
         if files:
             for f in files:
@@ -61,7 +81,8 @@ async def analyze(
         dataframes = {}
         for url in urls:
             try:
-                dataframes[url] = scrape_table_from_url(url)
+                df = scrape_table_from_url(url)
+                dataframes[url] = df
             except Exception:
                 dataframes[url] = None
 
@@ -70,7 +91,7 @@ async def analyze(
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 5: Compute answers
+        # Step 5: Answer questions
         answers_dict = {}
         for q in questions:
             try:
