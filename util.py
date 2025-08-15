@@ -53,25 +53,28 @@ def extract_keys_from_url_data(url, df):
 
     return list(keys)
 
-# ---------------- Key Collector ----------------
-def collect_all_keys(urls, dataframes):
+# ---------------- Collect All Keys ----------------
+def collect_all_keys(dataframes):
     """
-    Collect all possible keys for each URL/DataFrame.
-    Returns a dictionary {url: [keys]}.
+    Collect keys for all DataFrames in the format:
+      {url: [keys]}
     """
     all_keys = {}
-    for url in urls:
-        df = dataframes.get(url, pd.DataFrame())
+    for url, df in dataframes.items():
         keys = extract_keys_from_url_data(url, df)
-        # Optionally, add numeric column stats as keys
-        if not df.empty:
-            for col in df.select_dtypes(include=np.number).columns:
-                keys.add(f"{col}_sum")
-                keys.add(f"{col}_mean")
-                keys.add(f"{col}_count")
-                for col2 in df.select_dtypes(include=np.number).columns:
-                    if col != col2:
-                        keys.add(f"{col}_{col2}_correlation")
+
+        # Add standard numeric keys
+        numeric_cols = df.select_dtypes(include=np.number).columns
+        for col in numeric_cols:
+            keys.add(f"{col}_count")
+            keys.add(f"{col}_sum")
+            keys.add(f"{col}_mean")
+        # Add correlation keys if 2+ numeric columns
+        if len(numeric_cols) >= 2:
+            for i in range(len(numeric_cols)):
+                for j in range(i + 1, len(numeric_cols)):
+                    keys.add(f"{numeric_cols[i]}_{numeric_cols[j]}_correlation")
+
         all_keys[url] = list(keys)
     return all_keys
 
@@ -105,43 +108,72 @@ def parse_questions(content):
             questions.append(line)
     return questions, urls
 
-# ---------------- Analyzer ----------------
-def analyze_question(question, dataframes, uploaded_data=None):
+# ---------------- Analyzer (Updated) ----------------
+def analyze_question(question, dataframes, all_keys=None):
+    """
+    Analyze a question using available DataFrames and collected keys.
+    - question: string
+    - dataframes: {url: df}
+    - all_keys: {url: [keys]}
+    """
     question_lower = question.lower()
 
-    df = None
-    for df_candidate in dataframes.values():
-        if not df_candidate.empty and any(np.issubdtype(dt, np.number) for dt in df_candidate.dtypes):
-            df = df_candidate
-            break
+    # Try each DataFrame in order
+    for url, df in dataframes.items():
+        if df.empty:
+            continue
 
-    if df is None:
-        return "No data"
+        numeric_cols = df.select_dtypes(include=np.number).columns
+        keys = set(all_keys.get(url, [])) if all_keys else set()
 
-    numeric_cols = df.select_dtypes(include=np.number).columns
-    if len(numeric_cols) == 0:
-        return "No numeric data"
+        # Map question keywords to numeric operations
+        if "how many" in question_lower:
+            for col in numeric_cols:
+                key = f"{col}_count"
+                if key in keys:
+                    return int(df[col].count())
 
-    if "how many" in question_lower:
-        return int(df[numeric_cols[0]].count())
+        elif "sum" in question_lower:
+            for col in numeric_cols:
+                key = f"{col}_sum"
+                if key in keys:
+                    return float(df[col].sum())
 
-    elif "sum" in question_lower:
-        return float(df[numeric_cols[0]].sum())
+        elif "average" in question_lower or "mean" in question_lower:
+            for col in numeric_cols:
+                key = f"{col}_mean"
+                if key in keys:
+                    return float(df[col].mean())
 
-    elif "average" in question_lower or "mean" in question_lower:
-        return float(df[numeric_cols[0]].mean())
-
-    elif "correlation" in question_lower:
-        if len(numeric_cols) >= 2:
-            return float(df[numeric_cols[0]].corr(df[numeric_cols[1]]))
-        else:
+        elif "correlation" in question_lower:
+            if len(numeric_cols) >= 2:
+                col1, col2 = numeric_cols[:2]
+                key = f"{col1}_{col2}_correlation"
+                if key in keys:
+                    return float(df[col1].corr(df[col2]))
             return "Not enough numeric columns"
 
-    elif "plot" in question_lower:
-        if len(numeric_cols) >= 2:
-            return plot_scatter_base64(df, numeric_cols[0], numeric_cols[1])
-        else:
+        elif "plot" in question_lower:
+            if len(numeric_cols) >= 2:
+                col1, col2 = numeric_cols[:2]
+                return plot_scatter_base64(df, col1, col2)
             return "Not enough numeric columns"
 
-    else:
-        return "Not implemented"
+        else:
+            # Try matching any known key from all_keys
+            for key in keys:
+                if key in question_lower:
+                    if key.endswith("_count"):
+                        col = key[:-6]
+                        return int(df[col].count())
+                    elif key.endswith("_sum"):
+                        col = key[:-4]
+                        return float(df[col].sum())
+                    elif key.endswith("_mean"):
+                        col = key[:-5]
+                        return float(df[col].mean())
+                    elif "_correlation" in key:
+                        col1, col2 = key.split("_")[:2]
+                        return float(df[col1].corr(df[col2]))
+
+    return "No matching data found"
