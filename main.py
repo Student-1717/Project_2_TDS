@@ -1,27 +1,35 @@
 # main.py
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from typing import List, Optional
 import pandas as pd
 import io
+import base64
 
 # Import your util functions
 from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
+class APIRequestModel(BaseModel):
+    questions_txt: str  # the content of questions.txt as string
+    files: Optional[List[dict]] = None  
+    # each dict: { "filename": str, "content_base64": str }
+
 @app.post("/api/")
-async def analyze(
-    questions_txt: UploadFile = File(...),
-    files: Optional[List[UploadFile]] = None
-):
+async def analyze(request: APIRequestModel):
     """
-    Accepts a questions.txt file and optional additional files (CSV, images, etc.)
+    Accepts JSON input instead of file upload:
+    {
+        "questions_txt": "contents of questions.txt",
+        "files": [
+            { "filename": "data.csv", "content_base64": "<base64 encoded file>" }
+        ]
+    }
     Returns JSON array of answers.
     """
     try:
-        # Read questions.txt
-        questions_content = (await questions_txt.read()).decode("utf-8").strip()
+        questions_content = request.questions_txt.strip()
         if not questions_content:
             return JSONResponse(content=["No data"], status_code=200)
 
@@ -32,16 +40,16 @@ async def analyze(
 
         # Optional: read other uploaded files into dict for later use
         uploaded_data = {}
-        if files:
-            for f in files:
-                content = await f.read()
-                if f.filename.endswith(".csv"):
+        if request.files:
+            for f in request.files:
+                content = base64.b64decode(f["content_base64"])
+                if f["filename"].endswith(".csv"):
                     try:
-                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+                        uploaded_data[f["filename"]] = pd.read_csv(io.BytesIO(content))
                     except Exception:
-                        uploaded_data[f.filename] = None
+                        uploaded_data[f["filename"]] = None
                 else:
-                    uploaded_data[f.filename] = content  # keep raw bytes for images, etc.
+                    uploaded_data[f["filename"]] = content  # raw bytes for images, etc.
 
         # Scrape each URL into DataFrames
         dataframes = {}
