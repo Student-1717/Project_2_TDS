@@ -3,34 +3,36 @@ import pandas as pd
 import requests
 from io import BytesIO
 
-def load_data_from_url(url):
-    """Load data from URL dynamically. Returns a dict if multiple tables found."""
-    response = requests.get(url)
+def scrape_table_from_url(url):
+    """Scrape all HTML tables from a given URL and return as dict or merged DataFrame."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/115.0 Safari/537.36"
+    }
+    response = requests.get(url, headers=headers, timeout=15)
     response.raise_for_status()
-    content_type = response.headers.get('Content-Type', '').lower()
+    content_type = response.headers.get("Content-Type", "")
 
-    if 'html' in content_type or url.lower().endswith(('.htm', '.html')):
+    # If HTML, try reading all tables
+    if "html" in content_type or url.endswith(".html") or url.endswith("/"):
         tables = pd.read_html(response.text)
-        if tables:
-            # Return all tables as a dict {table_1: df, table_2: df, ...}
-            return {f"table_{i+1}": table for i, table in enumerate(tables)}
+        if not tables:
+            return pd.DataFrame()
+        if len(tables) == 1:
+            return tables[0]
         else:
-            return {}
-    elif 'csv' in content_type or url.lower().endswith('.csv'):
+            # Return merged DataFrame for analysis
+            merged = pd.concat(tables, ignore_index=True)
+            return merged
+
+    # CSV
+    elif "csv" in content_type or url.endswith(".csv"):
         return pd.read_csv(BytesIO(response.content))
-    elif 'excel' in content_type or url.lower().endswith(('.xls', '.xlsx')):
+
+    # Excel
+    elif "excel" in content_type or url.endswith((".xls", ".xlsx")):
         return pd.read_excel(BytesIO(response.content))
+
     else:
         raise ValueError(f"Unsupported URL data type: {content_type}")
-
-def load_data_from_file(file):
-    """Load data from uploaded file (CSV, Excel, JSON)."""
-    filename = file.filename.lower()
-    if filename.endswith('.csv'):
-        return pd.read_csv(file.file)
-    elif filename.endswith(('.xls', '.xlsx')):
-        return pd.read_excel(file.file)
-    elif filename.endswith('.json'):
-        return pd.read_json(file.file)
-    else:
-        raise ValueError(f"Unsupported file type: {filename}")
