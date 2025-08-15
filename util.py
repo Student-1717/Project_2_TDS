@@ -1,4 +1,3 @@
-# util.py
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6,6 +5,7 @@ import seaborn as sns
 import io
 import base64
 import numpy as np
+from urllib.parse import urlparse
 
 # ---------------- Scraper ----------------
 def scrape_table_from_url(url):
@@ -21,12 +21,43 @@ def scrape_table_from_url(url):
         print(f"Failed to scrape {url}: {e}")
     return pd.DataFrame()  # fallback empty
 
+# ---------------- Key Extractor ----------------
+def extract_keys_from_url_data(url, df):
+    """
+    Generate possible evaluator keys from:
+      1. URL path
+      2. Table column names
+      3. 'Rank' / 'Title' style column headers
+    """
+    keys = set()
+
+    # 1. From URL
+    try:
+        parsed = urlparse(url)
+        if parsed.path:
+            path_parts = [p for p in parsed.path.split("/") if p]
+            for part in path_parts:
+                keys.add(part.lower().replace(" ", "_"))
+    except Exception:
+        pass
+
+    # 2. From table columns
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for col in df.columns:
+            keys.add(str(col).lower().strip().replace(" ", "_"))
+
+    # 3. From specific known useful headers
+    for col in df.columns:
+        if "rank" in str(col).lower() or "title" in str(col).lower():
+            keys.add(str(col).lower().replace(" ", "_"))
+
+    return list(keys)
+
 # ---------------- Plotting ----------------
 def plot_scatter_base64(df, x_col, y_col, regression=True):
     plt.figure(figsize=(6,4))
     sns.scatterplot(x=x_col, y=y_col, data=df)
     if regression:
-        # Remove linestyle; regplot will draw a default regression line
         sns.regplot(x=x_col, y=y_col, data=df, scatter=False, color='red')
     plt.xlabel(x_col)
     plt.ylabel(y_col)
@@ -40,9 +71,6 @@ def plot_scatter_base64(df, x_col, y_col, regression=True):
 
 # ---------------- Question Parser ----------------
 def parse_questions(content):
-    """
-    Parse raw text of questions.txt into (questions_list, urls_list)
-    """
     questions = []
     urls = []
     for line in content.splitlines():
@@ -57,15 +85,8 @@ def parse_questions(content):
 
 # ---------------- Analyzer ----------------
 def analyze_question(question, dataframes, uploaded_data=None):
-    """
-    Dynamic analysis:
-      - Counts numeric columns for 'how many'
-      - Correlation between numeric columns for 'correlation'
-      - Scatterplot for 'plot'
-    """
     question_lower = question.lower()
 
-    # Choose first available dataframe with numeric data
     df = None
     for df_candidate in dataframes.values():
         if not df_candidate.empty and any(np.issubdtype(dt, np.number) for dt in df_candidate.dtypes):
@@ -79,9 +100,7 @@ def analyze_question(question, dataframes, uploaded_data=None):
     if len(numeric_cols) == 0:
         return "No numeric data"
 
-    # Dynamic answers
     if "how many" in question_lower:
-        # Return total rows of first numeric column
         return int(df[numeric_cols[0]].count())
 
     elif "sum" in question_lower:
