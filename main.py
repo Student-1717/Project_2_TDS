@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from typing import List, Optional
@@ -10,50 +9,42 @@ from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-
 def generate_key_from_question(question: str) -> str:
-    """
-    Maps question text to evaluator keys.
-    """
-    return question.lower().replace(" ", "_")  # simple placeholder mapping
-
+    return question.lower().replace(" ", "_")
 
 @app.post("/api/", response_model=None)
 async def analyze(
-    request=None,  # untyped so FastAPI doesn't try to validate
+    request: Request,
     questions_txt: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = None
 ):
-    """
-    Accepts:
-      - questions.txt file (multipart/form-data)
-      - JSON body with {"request": "...questions text..."}
-      - Optional additional files (CSV/images)
-    Returns:
-      - Dictionary keyed for evaluator
-    """
     try:
-        # 1️⃣ Read questions content
+        # Step 1: Read questions content
         questions_content = None
 
         if questions_txt:
+            # Multipart form upload of questions.txt
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
-        elif request:
+        else:
+            # Try reading JSON body
             try:
                 body = await request.json()
                 questions_content = body.get("request", "").strip()
-            except Exception:
-                pass
+            except json.JSONDecodeError:
+                # If not JSON, try raw text
+                raw_body = (await request.body()).decode("utf-8").strip()
+                if raw_body:
+                    questions_content = raw_body
 
         if not questions_content:
             return JSONResponse(content={"error": "No questions provided"}, status_code=200)
 
-        # 2️⃣ Parse questions and URLs
+        # Step 2: Parse questions and URLs
         questions, urls = parse_questions(questions_content)
         if not questions:
             return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
-        # 3️⃣ Optional uploaded files
+        # Step 3: Handle optional uploaded files
         uploaded_data = {}
         if files:
             for f in files:
@@ -64,9 +55,9 @@ async def analyze(
                     except Exception:
                         uploaded_data[f.filename] = None
                 else:
-                    uploaded_data[f.filename] = content  # raw bytes for images, etc.
+                    uploaded_data[f.filename] = content
 
-        # 4️⃣ Scrape URLs
+        # Step 4: Scrape URLs
         dataframes = {}
         for url in urls:
             try:
@@ -79,7 +70,7 @@ async def analyze(
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # 5️⃣ Compute answers in evaluator-compatible dict
+        # Step 5: Compute answers
         answers_dict = {}
         for q in questions:
             try:
