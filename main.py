@@ -2,22 +2,53 @@
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from typing import List, Optional
-import os
+import pandas as pd
+import io
 import json
-
-from util import parse_questions
+import os
 import openai
 
+from util import scrape_table_from_url, parse_questions
+
+from urllib.parse import urlparse
+
 app = FastAPI(title="TDS Data Analyst Agent")
-
-# Set OpenAI API key
-openai.api_key = os.environ.get("OPENAI_API_KEY")
-
 
 def generate_key_from_question(question: str) -> str:
     """Maps question text to evaluator keys (simple, generic)."""
     return question.lower().replace(" ", "_")
 
+def extract_keys_from_url_data(url, df):
+    """
+    Generate possible evaluator keys from:
+      1. URL path
+      2. Table column names
+      3. Special common headers
+    """
+    keys = set()
+
+    # 1. From URL
+    try:
+        parsed = urlparse(url)
+        if parsed.path:
+            path_parts = [p for p in parsed.path.split("/") if p]
+            for part in path_parts:
+                keys.add(part.lower().replace(" ", "_"))
+    except Exception:
+        pass
+
+    # 2. From table columns
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for col in df.columns:
+            keys.add(str(col).lower().strip().replace(" ", "_"))
+
+    # 3. From specific known useful headers
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for col in df.columns:
+            if "rank" in str(col).lower() or "title" in str(col).lower():
+                keys.add(str(col).lower().replace(" ", "_"))
+
+    return list(keys)
 
 def ask_ai_only_questions(questions: list) -> dict:
     """
@@ -28,7 +59,7 @@ def ask_ai_only_questions(questions: list) -> dict:
     for q in questions:
         key = generate_key_from_question(q)
         try:
-            response = openai.ChatCompletion.create(
+            response = openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {
@@ -49,15 +80,15 @@ def ask_ai_only_questions(questions: list) -> dict:
             answers_dict[key] = f"Error: {e}"
     return answers_dict
 
-
 @app.post("/api/")
 async def analyze(
     request: Request,
     questions_txt: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = None
 ):
     """
     Accepts:
-      - Multipart/form-data: questions.txt
+      - Multipart/form-data: questions.txt + optional CSV/image files
       - JSON: {"request": "...questions text..."}
     Returns:
       - Dictionary keyed for evaluator
@@ -86,12 +117,12 @@ async def analyze(
         if not questions_content:
             return JSONResponse(content={"error": "No questions provided"}, status_code=200)
 
-        # Step 2: Parse questions
-        questions, _ = parse_questions(questions_content)
+        # Step 2: Parse questions & URLs
+        questions, urls = parse_questions(questions_content)
         if not questions:
             return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
-        # Step 3: Send only questions to AI assistant
+        # Step 3: Ask AI only questions
         answers_dict = ask_ai_only_questions(questions)
 
         return JSONResponse(content=answers_dict)
