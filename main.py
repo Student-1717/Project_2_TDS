@@ -4,13 +4,12 @@ from fastapi.responses import JSONResponse
 from typing import List, Optional
 import pandas as pd
 import io
-import json
 import os
-import openai
 
-from util import scrape_table_from_url, parse_questions
+from util import scrape_table_from_url, analyze_question, parse_questions
 
 from urllib.parse import urlparse
+import openai  # Make sure openai>=1.0.0 is installed
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
@@ -51,10 +50,7 @@ def extract_keys_from_url_data(url, df):
     return list(keys)
 
 def ask_ai_only_questions(questions: list) -> dict:
-    """
-    Send only the questions list to the AI assistant and return a dictionary keyed
-    for the evaluator.
-    """
+    """Send only the questions to the AI and return answers dict."""
     answers_dict = {}
     for q in questions:
         key = generate_key_from_question(q)
@@ -74,7 +70,8 @@ def ask_ai_only_questions(questions: list) -> dict:
                 ],
                 temperature=0
             )
-            answer = response.choices[0].message["content"].strip()
+            # Access content as an attribute, not a dict
+            answer = response.choices[0].message.content.strip()
             answers_dict[key] = answer if answer else "No data"
         except Exception as e:
             answers_dict[key] = f"Error: {e}"
@@ -86,13 +83,6 @@ async def analyze(
     questions_txt: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = None
 ):
-    """
-    Accepts:
-      - Multipart/form-data: questions.txt + optional CSV/image files
-      - JSON: {"request": "...questions text..."}
-    Returns:
-      - Dictionary keyed for evaluator
-    """
     try:
         # Step 1: Get questions content
         questions_content = None
@@ -104,9 +94,12 @@ async def analyze(
                 body = await request.json()
                 questions_content = body.get("request", "").strip()
             except Exception:
-                raw_body = await request.body()
-                if raw_body:
-                    questions_content = raw_body.decode("utf-8").strip()
+                try:
+                    raw_body = await request.body()
+                    if raw_body:
+                        questions_content = raw_body.decode("utf-8").strip()
+                except Exception:
+                    pass
 
         if not questions_content:
             file_path = os.environ.get("QUESTIONS_FILE")
@@ -122,8 +115,54 @@ async def analyze(
         if not questions:
             return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
-        # Step 3: Ask AI only questions
+        # Step 3: Process uploaded files (optional)
+        uploaded_data = {}
+        if files:
+            for f in files:
+                content = await f.read()
+                if f.filename.endswith(".csv"):
+                    try:
+                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+                    except Exception:
+                        uploaded_data[f.filename] = None
+                else:
+                    uploaded_data[f.filename] = content
+
+        # Step 4: Scrape URLs & collect extra keys
+        dataframes = {}
+        extra_keys = set()
+        for url in urls:
+            try:
+                scraped = scrape_table_from_url(url)
+                dataframes[url] = scraped
+
+                if isinstance(scraped, dict):
+                    merged_df = pd.concat(
+                        [t for t in scraped.values() if isinstance(t, pd.DataFrame)],
+                        ignore_index=True
+                    ) if scraped else pd.DataFrame()
+                    df_for_keys = merged_df
+                else:
+                    df_for_keys = scraped
+
+                extra_keys.update(extract_keys_from_url_data(url, df_for_keys))
+                dataframes[url] = df_for_keys
+
+            except Exception:
+                dataframes[url] = None
+
+        # Include uploaded CSVs
+        for filename, df in uploaded_data.items():
+            if isinstance(df, pd.DataFrame):
+                dataframes[filename] = df
+
+        # Step 5: Ask AI for answers using only questions
         answers_dict = ask_ai_only_questions(questions)
+
+        # Step 6: Add placeholders for extracted keys
+        for key in extra_keys:
+            if key not in answers_dict:
+                answers_dict[key] = "No direct question, extracted from URL/table"
 
         return JSONResponse(content=answers_dict)
 
