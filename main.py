@@ -13,13 +13,13 @@ app = FastAPI(title="TDS Data Analyst Agent")
 def generate_key_from_question(question: str) -> str:
     """
     Placeholder function to map question text to evaluator keys.
-    Replace this with your actual mapping logic.
+    Replace with your actual mapping logic.
     """
     return question.lower().replace(" ", "_")  # simple example
 
-@app.post("/api/")
+@app.post("/api/", response_model=None)
 async def analyze(
-    request: Optional[Request] = None,
+    request=None,  # keep untyped to avoid FastAPI Pydantic issue
     questions_txt: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = None
 ):
