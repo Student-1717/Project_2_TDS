@@ -10,6 +10,13 @@ from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
+def generate_key_from_question(question: str) -> str:
+    """
+    Placeholder function to map question text to evaluator keys.
+    Replace this with your actual mapping logic.
+    """
+    return question.lower().replace(" ", "_")  # simple example
+
 @app.post("/api/")
 async def analyze(
     request: Optional[Request] = None,
@@ -17,9 +24,12 @@ async def analyze(
     files: Optional[List[UploadFile]] = None
 ):
     """
-    Accepts a questions.txt file (multipart/form-data) or JSON body with 'request' field,
-    plus optional additional files (CSV, images, etc.).
-    Returns a dictionary with keys expected by the evaluation.
+    Accepts:
+      - questions.txt file (multipart/form-data)
+      - JSON body with {"request": "...questions text..."}
+      - Optional additional files (CSV/images)
+    Returns:
+      - Dictionary keyed for evaluator
     """
     try:
         # Step 1: Read questions content
@@ -35,12 +45,12 @@ async def analyze(
                 pass
 
         if not questions_content:
-            return JSONResponse(content={"error": "No data"}, status_code=200)
+            return JSONResponse(content={"error": "No questions provided"}, status_code=200)
 
         # Step 2: Parse questions and URLs
         questions, urls = parse_questions(questions_content)
         if not questions:
-            return JSONResponse(content={"error": "No data"}, status_code=200)
+            return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
         # Step 3: Optional uploaded files
         uploaded_data = {}
@@ -68,25 +78,14 @@ async def analyze(
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 5: Compute answers and map to expected keys
+        # Step 5: Compute answers in evaluator-compatible dict
         answers_dict = {}
-
         for q in questions:
             try:
+                key = generate_key_from_question(q)
                 ans = analyze_question(q, dataframes, uploaded_data)
-                if not ans:
-                    ans = "No data"
-
-                # Map questions to expected keys
-                if "shortest path alice to eve" in q.lower():
-                    answers_dict["shortest_path_alice_eve"] = ans
-                else:
-                    # Use question text as fallback key
-                    key = q.lower().replace(" ", "_")
-                    answers_dict[key] = ans
-
+                answers_dict[key] = ans if ans else "No data"
             except Exception as e:
-                key = q.lower().replace(" ", "_")
                 answers_dict[key] = f"Error: {e}"
 
         return JSONResponse(content=answers_dict)
