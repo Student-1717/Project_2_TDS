@@ -1,29 +1,37 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional
 import pandas as pd
 import io
-import base64
+import os
 
 # Import your util functions
 from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-class FileItem(BaseModel):
-    filename: str
-    content_base64: str  # Base64-encoded file content
-
-class QuestionRequest(BaseModel):
-    questions_txt: str
-    files: Optional[List[FileItem]] = None
+class AnalyzeRequest(BaseModel):
+    questions_txt: str  # can be raw text or "file://<path>"
 
 @app.post("/api/")
-async def analyze(request: QuestionRequest):
+async def analyze(
+    request: AnalyzeRequest,
+    files: Optional[List[UploadFile]] = File(None)
+):
     try:
         questions_content = request.questions_txt.strip()
+
+        # If questions_txt is a file path, read the file
+        if questions_content.startswith("file://"):
+            file_path = questions_content[len("file://"):]
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    questions_content = f.read().strip()
+            else:
+                return JSONResponse(content=["File not found"], status_code=400)
+
         if not questions_content:
             return JSONResponse(content=["No data"], status_code=200)
 
@@ -32,21 +40,21 @@ async def analyze(request: QuestionRequest):
         if not questions:
             return JSONResponse(content=["No data"], status_code=200)
 
-        # Optional: read uploaded files
-        uploaded_data: Dict[str, Optional[pd.DataFrame]] = {}
-        if request.files:
-            for f in request.files:
-                content_bytes = base64.b64decode(f.content_base64)
+        # Optional: read uploaded files into dict
+        uploaded_data = {}
+        if files:
+            for f in files:
+                content = await f.read()
                 if f.filename.endswith(".csv"):
                     try:
-                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content_bytes))
+                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
                     except Exception:
                         uploaded_data[f.filename] = None
                 else:
-                    uploaded_data[f.filename] = content_bytes  # keep raw bytes for images, etc.
+                    uploaded_data[f.filename] = content  # keep raw bytes for images etc.
 
         # Scrape each URL into DataFrames
-        dataframes: Dict[str, Optional[pd.DataFrame]] = {}
+        dataframes = {}
         for url in urls:
             try:
                 dataframes[url] = scrape_table_from_url(url)
