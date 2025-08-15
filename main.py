@@ -5,6 +5,9 @@ from typing import List, Optional
 import pandas as pd
 import io
 import os
+import matplotlib.pyplot as plt
+import base64
+import numpy as np  # <-- Added for polyfit
 
 from util import scrape_table_from_url, analyze_question, parse_questions
 
@@ -49,12 +52,42 @@ def extract_keys_from_url_data(url, df):
 
     return list(keys)
 
-def ask_ai_only_questions(questions: list) -> dict:
+def ask_ai_only_questions(questions: list, dataframes=None, uploaded_data=None) -> dict:
     """Send only the questions to the AI and return answers dict."""
     answers_dict = {}
+    dataframes = dataframes or {}
+    uploaded_data = uploaded_data or {}
+
     for q in questions:
         key = generate_key_from_question(q)
         try:
+            # Special handling for scatterplot question
+            if "scatterplot" in q.lower() and "rank" in q.lower() and "peak" in q.lower():
+                df_to_use = None
+                for df in list(dataframes.values()) + list(uploaded_data.values()):
+                    if isinstance(df, pd.DataFrame) and "rank" in df.columns and "peak" in df.columns:
+                        df_to_use = df
+                        break
+                if df_to_use is not None:
+                    plt.figure()
+                    plt.scatter(df_to_use["rank"], df_to_use["peak"])
+                    plt.xlabel("Rank")
+                    plt.ylabel("Peak")
+                    plt.title("Rank vs Peak")
+                    # Corrected polyfit usage
+                    m, b = np.polyfit(df_to_use["rank"], df_to_use["peak"], 1)
+                    plt.plot(df_to_use["rank"], m*df_to_use["rank"] + b, "r--")
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format="png")
+                    plt.close()
+                    buf.seek(0)
+                    b64_img = base64.b64encode(buf.read()).decode("utf-8")
+                    answers_dict[key] = f"data:image/png;base64,{b64_img}"
+                else:
+                    answers_dict[key] = "No table contains both 'rank' and 'peak' columns"
+                continue
+
+            # Standard AI completion
             response = openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -70,7 +103,6 @@ def ask_ai_only_questions(questions: list) -> dict:
                 ],
                 temperature=0
             )
-            # Access content as an attribute, not a dict
             answer = response.choices[0].message.content.strip()
             answers_dict[key] = answer if answer else "No data"
         except Exception as e:
@@ -157,7 +189,7 @@ async def analyze(
                 dataframes[filename] = df
 
         # Step 5: Ask AI for answers using only questions
-        answers_dict = ask_ai_only_questions(questions)
+        answers_dict = ask_ai_only_questions(questions, dataframes=dataframes, uploaded_data=uploaded_data)
 
         # Step 6: Add placeholders for extracted keys
         for key in extra_keys:
