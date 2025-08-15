@@ -53,6 +53,28 @@ def extract_keys_from_url_data(url, df):
 
     return list(keys)
 
+# ---------------- Key Collector ----------------
+def collect_all_keys(urls, dataframes):
+    """
+    Collect all possible keys for each URL/DataFrame.
+    Returns a dictionary {url: [keys]}.
+    """
+    all_keys = {}
+    for url in urls:
+        df = dataframes.get(url, pd.DataFrame())
+        keys = extract_keys_from_url_data(url, df)
+        # Optionally, add numeric column stats as keys
+        if not df.empty:
+            for col in df.select_dtypes(include=np.number).columns:
+                keys.add(f"{col}_sum")
+                keys.add(f"{col}_mean")
+                keys.add(f"{col}_count")
+                for col2 in df.select_dtypes(include=np.number).columns:
+                    if col != col2:
+                        keys.add(f"{col}_{col2}_correlation")
+        all_keys[url] = list(keys)
+    return all_keys
+
 # ---------------- Plotting ----------------
 def plot_scatter_base64(df, x_col, y_col, regression=True):
     plt.figure(figsize=(6,4))
