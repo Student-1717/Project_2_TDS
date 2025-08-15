@@ -5,31 +5,24 @@ from typing import List, Optional
 import pandas as pd
 import io
 import os
-import matplotlib.pyplot as plt
+from urllib.parse import urlparse
+import openai  # make sure openai>=1.0.0 is installed
 import base64
-import numpy as np  # <-- Added for polyfit
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from util import scrape_table_from_url, analyze_question, parse_questions
 
-from urllib.parse import urlparse
-import openai  # Make sure openai>=1.0.0 is installed
-
 app = FastAPI(title="TDS Data Analyst Agent")
 
+
 def generate_key_from_question(question: str) -> str:
-    """Maps question text to evaluator keys (simple, generic)."""
     return question.lower().replace(" ", "_")
 
-def extract_keys_from_url_data(url, df):
-    """
-    Generate possible evaluator keys from:
-      1. URL path
-      2. Table column names
-      3. Special common headers
-    """
-    keys = set()
 
-    # 1. From URL
+def extract_keys_from_url_data(url, df):
+    keys = set()
+    # From URL
     try:
         parsed = urlparse(url)
         if parsed.path:
@@ -39,12 +32,12 @@ def extract_keys_from_url_data(url, df):
     except Exception:
         pass
 
-    # 2. From table columns
+    # From table columns
     if isinstance(df, pd.DataFrame) and not df.empty:
         for col in df.columns:
             keys.add(str(col).lower().strip().replace(" ", "_"))
 
-    # 3. From specific known useful headers
+    # From known headers
     if isinstance(df, pd.DataFrame) and not df.empty:
         for col in df.columns:
             if "rank" in str(col).lower() or "title" in str(col).lower():
@@ -52,42 +45,12 @@ def extract_keys_from_url_data(url, df):
 
     return list(keys)
 
-def ask_ai_only_questions(questions: list, dataframes=None, uploaded_data=None) -> dict:
-    """Send only the questions to the AI and return answers dict."""
-    answers_dict = {}
-    dataframes = dataframes or {}
-    uploaded_data = uploaded_data or {}
 
+def ask_ai_only_questions(questions: list) -> dict:
+    answers_dict = {}
     for q in questions:
         key = generate_key_from_question(q)
         try:
-            # Special handling for scatterplot question
-            if "scatterplot" in q.lower() and "rank" in q.lower() and "peak" in q.lower():
-                df_to_use = None
-                for df in list(dataframes.values()) + list(uploaded_data.values()):
-                    if isinstance(df, pd.DataFrame) and "rank" in df.columns and "peak" in df.columns:
-                        df_to_use = df
-                        break
-                if df_to_use is not None:
-                    plt.figure()
-                    plt.scatter(df_to_use["rank"], df_to_use["peak"])
-                    plt.xlabel("Rank")
-                    plt.ylabel("Peak")
-                    plt.title("Rank vs Peak")
-                    # Corrected polyfit usage
-                    m, b = np.polyfit(df_to_use["rank"], df_to_use["peak"], 1)
-                    plt.plot(df_to_use["rank"], m*df_to_use["rank"] + b, "r--")
-                    buf = io.BytesIO()
-                    plt.savefig(buf, format="png")
-                    plt.close()
-                    buf.seek(0)
-                    b64_img = base64.b64encode(buf.read()).decode("utf-8")
-                    answers_dict[key] = f"data:image/png;base64,{b64_img}"
-                else:
-                    answers_dict[key] = "No table contains both 'rank' and 'peak' columns"
-                continue
-
-            # Standard AI completion
             response = openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -109,6 +72,38 @@ def ask_ai_only_questions(questions: list, dataframes=None, uploaded_data=None) 
             answers_dict[key] = f"Error: {e}"
     return answers_dict
 
+
+# --- New functions for scatterplot ---
+def find_rank_peak_df(dataframes: dict):
+    for name, df in dataframes.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            cols = [c.lower().strip() for c in df.columns]
+            if "rank" in cols and "peak" in cols:
+                rank_col = df.columns[cols.index("rank")]
+                peak_col = df.columns[cols.index("peak")]
+                return df[[rank_col, peak_col]], rank_col, peak_col
+    return None, None, None
+
+
+def generate_scatterplot(df, rank_col, peak_col):
+    plt.figure(figsize=(6, 4))
+    sns.regplot(
+        x=rank_col, y=peak_col, data=df,
+        scatter=True, line_kws={"color": "red", "linestyle": "dotted"}
+    )
+    plt.xlabel(rank_col)
+    plt.ylabel(peak_col)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    plt.close()
+    buf.seek(0)
+    img_bytes = buf.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+    return f"data:image/png;base64,{img_base64}"
+
+
 @app.post("/api/")
 async def analyze(
     request: Request,
@@ -118,7 +113,6 @@ async def analyze(
     try:
         # Step 1: Get questions content
         questions_content = None
-
         if questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
         else:
@@ -147,7 +141,7 @@ async def analyze(
         if not questions:
             return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
-        # Step 3: Process uploaded files (optional)
+        # Step 3: Process uploaded files
         uploaded_data = {}
         if files:
             for f in files:
@@ -188,13 +182,20 @@ async def analyze(
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 5: Ask AI for answers using only questions
-        answers_dict = ask_ai_only_questions(questions, dataframes=dataframes, uploaded_data=uploaded_data)
+        # Step 5: Ask AI questions
+        answers_dict = ask_ai_only_questions(questions)
 
         # Step 6: Add placeholders for extracted keys
         for key in extra_keys:
             if key not in answers_dict:
                 answers_dict[key] = "No direct question, extracted from URL/table"
+
+        # Step 7: Generate scatterplot if possible
+        scatter_df, rank_col, peak_col = find_rank_peak_df(dataframes)
+        if scatter_df is not None:
+            answers_dict["scatterplot_rank_peak"] = generate_scatterplot(scatter_df, rank_col, peak_col)
+        else:
+            answers_dict["scatterplot_rank_peak"] = "No table contains both 'rank' and 'peak' columns"
 
         return JSONResponse(content=answers_dict)
 
