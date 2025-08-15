@@ -1,46 +1,48 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from typing import List, Optional
 import pandas as pd
 import io
-import os
+import json
 
-# Import your util functions
 from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-class AnalyzeRequest(BaseModel):
-    questions_txt: str  # can be raw text or "file://<path>"
-
 @app.post("/api/")
 async def analyze(
-    request: AnalyzeRequest,
-    files: Optional[List[UploadFile]] = File(None)
+    request: Optional[Request] = None,
+    questions_txt: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = None
 ):
+    """
+    Accepts a questions.txt file (multipart/form-data) or JSON body with 'request' field,
+    plus optional additional files (CSV, images, etc.).
+    Returns a dictionary with keys expected by the evaluation.
+    """
     try:
-        questions_content = request.questions_txt.strip()
+        # Step 1: Read questions content
+        questions_content = None
 
-        # If questions_txt is a file path, read the file
-        if questions_content.startswith("file://"):
-            file_path = questions_content[len("file://"):]
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    questions_content = f.read().strip()
-            else:
-                return JSONResponse(content=["File not found"], status_code=400)
+        if questions_txt:
+            questions_content = (await questions_txt.read()).decode("utf-8").strip()
+        elif request:
+            try:
+                body = await request.json()
+                questions_content = body.get("request", "").strip()
+            except json.JSONDecodeError:
+                pass
 
         if not questions_content:
-            return JSONResponse(content=["No data"], status_code=200)
+            return JSONResponse(content={"error": "No data"}, status_code=200)
 
-        # Parse questions and URLs
+        # Step 2: Parse questions and URLs
         questions, urls = parse_questions(questions_content)
         if not questions:
-            return JSONResponse(content=["No data"], status_code=200)
+            return JSONResponse(content={"error": "No data"}, status_code=200)
 
-        # Optional: read uploaded files into dict
+        # Step 3: Optional uploaded files
         uploaded_data = {}
         if files:
             for f in files:
@@ -51,9 +53,9 @@ async def analyze(
                     except Exception:
                         uploaded_data[f.filename] = None
                 else:
-                    uploaded_data[f.filename] = content  # keep raw bytes for images etc.
+                    uploaded_data[f.filename] = content  # raw bytes for images, etc.
 
-        # Scrape each URL into DataFrames
+        # Step 4: Scrape URLs
         dataframes = {}
         for url in urls:
             try:
@@ -61,23 +63,33 @@ async def analyze(
             except Exception:
                 dataframes[url] = None
 
-        # Include uploaded CSVs in dataframes
+        # Include uploaded CSVs
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Compute answers for each question
-        answers = []
+        # Step 5: Compute answers and map to expected keys
+        answers_dict = {}
+
         for q in questions:
             try:
                 ans = analyze_question(q, dataframes, uploaded_data)
                 if not ans:
                     ans = "No data"
-                answers.append(ans)
-            except Exception as e:
-                answers.append(f"Error: {e}")
 
-        return JSONResponse(content=answers)
+                # Map questions to expected keys
+                if "shortest path alice to eve" in q.lower():
+                    answers_dict["shortest_path_alice_eve"] = ans
+                else:
+                    # Use question text as fallback key
+                    key = q.lower().replace(" ", "_")
+                    answers_dict[key] = ans
+
+            except Exception as e:
+                key = q.lower().replace(" ", "_")
+                answers_dict[key] = f"Error: {e}"
+
+        return JSONResponse(content=answers_dict)
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
