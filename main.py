@@ -13,15 +13,14 @@ app = FastAPI(title="TDS Data Analyst Agent")
 
 def generate_key_from_question(question: str) -> str:
     """
-    Placeholder function to map question text to evaluator keys.
-    Replace with your actual mapping logic.
+    Maps question text to evaluator keys.
     """
-    return question.lower().replace(" ", "_")  # simple example
+    return question.lower().replace(" ", "_")  # simple placeholder mapping
 
 
 @app.post("/api/", response_model=None)
 async def analyze(
-    request: Optional[Request] = None,  # optional untyped request
+    request=None,  # untyped so FastAPI doesn't try to validate
     questions_txt: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = None
 ):
@@ -34,7 +33,7 @@ async def analyze(
       - Dictionary keyed for evaluator
     """
     try:
-        # Step 1: Read questions content
+        # 1️⃣ Read questions content
         questions_content = None
 
         if questions_txt:
@@ -49,12 +48,12 @@ async def analyze(
         if not questions_content:
             return JSONResponse(content={"error": "No questions provided"}, status_code=200)
 
-        # Step 2: Parse questions and URLs
+        # 2️⃣ Parse questions and URLs
         questions, urls = parse_questions(questions_content)
         if not questions:
             return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
 
-        # Step 3: Optional uploaded files
+        # 3️⃣ Optional uploaded files
         uploaded_data = {}
         if files:
             for f in files:
@@ -67,7 +66,7 @@ async def analyze(
                 else:
                     uploaded_data[f.filename] = content  # raw bytes for images, etc.
 
-        # Step 4: Scrape URLs
+        # 4️⃣ Scrape URLs
         dataframes = {}
         for url in urls:
             try:
@@ -80,7 +79,7 @@ async def analyze(
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 5: Compute answers in evaluator-compatible dict
+        # 5️⃣ Compute answers in evaluator-compatible dict
         answers_dict = {}
         for q in questions:
             try:
