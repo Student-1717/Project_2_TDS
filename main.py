@@ -7,9 +7,8 @@ import io
 import json
 import os
 
-from scraper import load_data_from_url, load_data_from_file  # ✅ updated import
+from util import scrape_table_from_url, analyze_question, parse_questions
 
-from util import analyze_question, parse_questions
 from urllib.parse import urlparse
 
 app = FastAPI(title="TDS Data Analyst Agent")
@@ -43,9 +42,10 @@ def extract_keys_from_url_data(url, df):
             keys.add(str(col).lower().strip().replace(" ", "_"))
 
     # 3. From specific known useful headers
-    for col in df.columns:
-        if "rank" in str(col).lower() or "title" in str(col).lower():
-            keys.add(str(col).lower().replace(" ", "_"))
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for col in df.columns:
+            if "rank" in str(col).lower() or "title" in str(col).lower():
+                keys.add(str(col).lower().replace(" ", "_"))
 
     return list(keys)
 
@@ -103,28 +103,40 @@ async def analyze(
         if files:
             for f in files:
                 content = await f.read()
-                try:
-                    uploaded_data[f.filename] = load_data_from_file(f)  # ✅ use new loader
-                except Exception:
-                    uploaded_data[f.filename] = None
+                if f.filename.endswith(".csv"):
+                    try:
+                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+                    except Exception:
+                        uploaded_data[f.filename] = None
+                else:
+                    uploaded_data[f.filename] = content
 
-        # Step 4: Scrape URLs & collect extra keys
+        # Step 4: Scrape URLs & collect extra keys (updated for multi-table support)
         dataframes = {}
         extra_keys = set()
         for url in urls:
             try:
-                df_or_tables = load_data_from_url(url)  # ✅ new dynamic loader
-                if isinstance(df_or_tables, dict):  # multiple tables
-                    for name, df in df_or_tables.items():
-                        dataframes[f"{url}::{name}"] = df
-                        extra_keys.update(extract_keys_from_url_data(url, df))
+                scraped = scrape_table_from_url(url)
+                dataframes[url] = scraped  # Keep original (DataFrame or dict)
+
+                # Merge if multiple tables
+                if isinstance(scraped, dict):
+                    merged_df = pd.concat(
+                        [t for t in scraped.values() if isinstance(t, pd.DataFrame)],
+                        ignore_index=True
+                    ) if scraped else pd.DataFrame()
+                    df_for_keys = merged_df
                 else:
-                    dataframes[url] = df_or_tables
-                    extra_keys.update(extract_keys_from_url_data(url, df_or_tables))
+                    df_for_keys = scraped
+
+                extra_keys.update(extract_keys_from_url_data(url, df_for_keys))
+                # Replace with merged for analysis
+                dataframes[url] = df_for_keys
+
             except Exception:
                 dataframes[url] = None
 
-        # Include uploaded CSV/Excel/JSON
+        # Include uploaded CSVs
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
