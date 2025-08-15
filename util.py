@@ -1,106 +1,107 @@
-# util.py
-import requests
+# main.py
+from fastapi import FastAPI, File, UploadFile, Request
+from fastapi.responses import JSONResponse
+from typing import List, Optional
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 import io
-import base64
-import numpy as np
+import json
+import os
 
-# ---------------- Scraper ----------------
-def scrape_table_from_url(url):
-    """Fetch tables from any URL and return the first non-empty DataFrame."""
+from util import scrape_table_from_url, analyze_question, parse_questions
+
+app = FastAPI(title="TDS Data Analyst Agent")
+
+def generate_key_from_question(question: str) -> str:
+    """Maps question text to evaluator keys (simple, generic)."""
+    return question.lower().replace(" ", "_")
+
+@app.post("/api/")
+async def analyze(
+    request: Request,
+    questions_txt: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = None
+):
+    """
+    Accepts:
+      - Multipart/form-data: questions.txt + optional CSV/image files
+      - JSON: {"request": "...questions text..."}
+    Returns:
+      - Dictionary keyed for evaluator
+    """
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        tables = pd.read_html(response.text)
-        for table in tables:
-            if not table.empty:
-                return table
+        # Step 1: Get questions content
+        questions_content = None
+
+        if questions_txt:
+            # If provided as file upload
+            questions_content = (await questions_txt.read()).decode("utf-8").strip()
+        else:
+            # Try reading JSON body
+            try:
+                body = await request.json()
+                questions_content = body.get("request", "").strip()
+            except Exception:
+                # If request.json() fails, maybe it's raw text (promptfoo file mode)
+                try:
+                    raw_body = await request.body()
+                    if raw_body:
+                        questions_content = raw_body.decode("utf-8").strip()
+                except Exception:
+                    pass
+
+        # Also allow file path from env or config for local eval
+        if not questions_content:
+            file_path = os.environ.get("QUESTIONS_FILE")
+            if file_path and os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    questions_content = f.read().strip()
+
+        if not questions_content:
+            return JSONResponse(content={"error": "No questions provided"}, status_code=200)
+
+        # Step 2: Parse questions & URLs
+        questions, urls = parse_questions(questions_content)
+        if not questions:
+            return JSONResponse(content={"error": "No valid questions found"}, status_code=200)
+
+        # Step 3: Process uploaded files (optional)
+        uploaded_data = {}
+        if files:
+            for f in files:
+                content = await f.read()
+                if f.filename.endswith(".csv"):
+                    try:
+                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+                    except Exception:
+                        uploaded_data[f.filename] = None
+                else:
+                    uploaded_data[f.filename] = content
+
+        # Step 4: Scrape URLs
+        dataframes = {}
+        for url in urls:
+            try:
+                df = scrape_table_from_url(url)
+                dataframes[url] = df
+            except Exception:
+                dataframes[url] = None
+
+        # Include uploaded CSVs
+        for filename, df in uploaded_data.items():
+            if isinstance(df, pd.DataFrame):
+                dataframes[filename] = df
+
+        # Step 5: Answer questions
+        answers_dict = {}
+        for q in questions:
+            try:
+                key = generate_key_from_question(q)
+                ans = analyze_question(q, dataframes, uploaded_data)
+                answers_dict[key] = ans if ans else "No data"
+            except Exception as e:
+                answers_dict[key] = f"Error: {e}"
+
+        return JSONResponse(content=answers_dict)
+
     except Exception as e:
-        print(f"Failed to scrape {url}: {e}")
-    return pd.DataFrame()  # fallback empty
-
-# ---------------- Plotting ----------------
-def plot_scatter_base64(df, x_col, y_col, regression=True):
-    plt.figure(figsize=(6,4))
-    sns.scatterplot(x=x_col, y=y_col, data=df)
-    if regression:
-        # Remove linestyle; regplot will draw a default regression line
-        sns.regplot(x=x_col, y=y_col, data=df, scatter=False, color='red')
-    plt.xlabel(x_col)
-    plt.ylabel(y_col)
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=80)
-    plt.close()
-    buf.seek(0)
-    encoded = base64.b64encode(buf.read()).decode('utf-8')
-    return f"data:image/png;base64,{encoded}"
-
-# ---------------- Question Parser ----------------
-def parse_questions(content):
-    """
-    Parse raw text of questions.txt into (questions_list, urls_list)
-    """
-    questions = []
-    urls = []
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("http"):  # treat as URL
-            urls.append(line)
-        else:
-            questions.append(line)
-    return questions, urls
-
-# ---------------- Analyzer ----------------
-def analyze_question(question, dataframes, uploaded_data=None):
-    """
-    Dynamic analysis:
-      - Counts numeric columns for 'how many'
-      - Correlation between numeric columns for 'correlation'
-      - Scatterplot for 'plot'
-    """
-    question_lower = question.lower()
-
-    # Choose first available dataframe with numeric data
-    df = None
-    for df_candidate in dataframes.values():
-        if not df_candidate.empty and any(np.issubdtype(dt, np.number) for dt in df_candidate.dtypes):
-            df = df_candidate
-            break
-
-    if df is None:
-        return "No data"
-
-    numeric_cols = df.select_dtypes(include=np.number).columns
-    if len(numeric_cols) == 0:
-        return "No numeric data"
-
-    # Dynamic answers
-    if "how many" in question_lower:
-        # Return total rows of first numeric column
-        return int(df[numeric_cols[0]].count())
-
-    elif "sum" in question_lower:
-        return float(df[numeric_cols[0]].sum())
-
-    elif "average" in question_lower or "mean" in question_lower:
-        return float(df[numeric_cols[0]].mean())
-
-    elif "correlation" in question_lower:
-        if len(numeric_cols) >= 2:
-            return float(df[numeric_cols[0]].corr(df[numeric_cols[1]]))
-        else:
-            return "Not enough numeric columns"
-
-    elif "plot" in question_lower:
-        if len(numeric_cols) >= 2:
-            return plot_scatter_base64(df, numeric_cols[0], numeric_cols[1])
-        else:
-            return "Not enough numeric columns"
-
-    else:
-        return "Not implemented"
+        return JSONResponse(content={"error": str(e)}, status_code=500)
