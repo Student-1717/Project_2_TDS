@@ -1,94 +1,57 @@
-from fastapi import FastAPI, UploadFile, File
+# main.py
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
-import os
-import re
-from typing import List
+from typing import List, Optional
+import pandas as pd
+import io
 
-from scraper import scrape_and_analyze
-from analyzer import analyze_data_files
+# Import your util functions
+from util import scrape_table_from_url, analyze_question, parse_questions
 
-app = FastAPI()
-
-DUMMY_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-
-def process_request(question_path: str, file_dict: dict):
-    with open(question_path, "r", encoding="utf-8") as f:
-        question = f.read()
-
-    # Check for URL
-    url_match = re.search(r'https?://[^\s)]+', question)
-    if url_match:
-        url = url_match.group(0)
-        return scrape_and_analyze(url, question)
-    else:
-        return analyze_data_files(question, file_dict)
+app = FastAPI(title="TDS Data Analyst Agent")
 
 @app.post("/api/")
-async def api_endpoint(files: List[UploadFile] = File(...)):
-    tmp_dir = "/tmp/tds_agent"
-    os.makedirs(tmp_dir, exist_ok=True)
+async def analyze(
+    questions_txt: UploadFile = File(...),
+    files: Optional[List[UploadFile]] = None
+):
+    """
+    Accepts a questions.txt file and optional additional files (CSV, images, etc.)
+    Returns JSON array of answers.
+    """
+    # Read questions.txt
+    questions_content = (await questions_txt.read()).decode("utf-8")
 
-    question_path = None
-    file_dict = {}
-    txt_files = []
+    # Optional: read other uploaded files into dict for later use
+    uploaded_data = {}
+    if files:
+        for f in files:
+            content = await f.read()
+            if f.filename.endswith(".csv"):
+                uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+            else:
+                uploaded_data[f.filename] = content  # keep raw bytes for images, etc.
 
-    # Save uploaded files
-    for file in files:
-        file_path = os.path.join(tmp_dir, file.filename)
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
+    # Parse questions and URLs
+    questions, urls = parse_questions(questions_content)
 
-        if file.filename.lower() == "questions.txt":
-            question_path = file_path
-        elif file.filename.lower().endswith(".txt"):
-            txt_files.append(file_path)
-        else:
-            file_dict[file.filename] = file_path
+    # Scrape each URL into DataFrames
+    dataframes = {}
+    for url in urls:
+        dataframes[url] = scrape_table_from_url(url)
 
-    # Fallback to first .txt if no questions.txt
-    if not question_path and txt_files:
-        question_path = txt_files[0]
+    # Include uploaded CSVs in dataframes
+    for filename, df in uploaded_data.items():
+        if isinstance(df, pd.DataFrame):
+            dataframes[filename] = df
 
-    # If still no txt file, return dummy JSON
-    if not question_path:
-        result = {
-            "edge_count": 0,
-            "highest_degree_node": "",
-            "average_degree": 0,
-            "density": 0,
-            "shortest_path_alice_eve": 0,
-            "network_graph": DUMMY_IMAGE,
-            "degree_histogram": DUMMY_IMAGE
-        }
-    else:
+    # Compute answers for each question
+    answers = []
+    for q in questions:
         try:
-            result = process_request(question_path, file_dict)
-            if result is None:
-                result = {
-                    "edge_count": 0,
-                    "highest_degree_node": "",
-                    "average_degree": 0,
-                    "density": 0,
-                    "shortest_path_alice_eve": 0,
-                    "network_graph": DUMMY_IMAGE,
-                    "degree_histogram": DUMMY_IMAGE
-                }
-        except Exception:
-            result = {
-                "edge_count": 0,
-                "highest_degree_node": "",
-                "average_degree": 0,
-                "density": 0,
-                "shortest_path_alice_eve": 0,
-                "network_graph": DUMMY_IMAGE,
-                "degree_histogram": DUMMY_IMAGE
-            }
+            ans = analyze_question(q, dataframes, uploaded_data)
+            answers.append(ans)
+        except Exception as e:
+            answers.append(f"Error: {e}")
 
-    # Cleanup all tmp files
-    for path in os.listdir(tmp_dir):
-        try:
-            os.remove(os.path.join(tmp_dir, path))
-        except Exception:
-            pass
-
-    return JSONResponse(content=result)
+    return JSONResponse(content=answers)
