@@ -33,17 +33,36 @@ def generate_scatterplot(df, x_col, y_col):
 
 def compute_local_value(key, dataframes):
     """
-    Example local computations for small CSVs. 
-    Add heuristics for other types dynamically if needed.
+    Enhanced local computations for CSVs.
+    Handles numeric sums, means, and scatterplots automatically.
     """
+    key_lower = key.lower()
     for df in dataframes.values():
         if isinstance(df, pd.DataFrame):
-            # Example: numeric columns
-            if key.lower() in df.columns.str.lower():
-                return df[key].sum() if df[key].dtype in [int, float] else "N/A"
-            # If key contains 'scatterplot', return plot
-            if "plot" in key.lower() and len(df.columns) >= 2:
-                return generate_scatterplot(df, df.columns[0], df.columns[1])
+            # Exact column match (case-insensitive)
+            col_matches = [col for col in df.columns if col.lower() == key_lower]
+            if col_matches:
+                col = col_matches[0]
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    return df[col].sum()
+                else:
+                    return "N/A"
+            
+            # Partial match for aggregate stats
+            if "sum" in key_lower or "total" in key_lower:
+                numeric_cols = df.select_dtypes(include="number").columns
+                if numeric_cols.any():
+                    return df[numeric_cols].sum().to_dict()
+            if "mean" in key_lower or "average" in key_lower:
+                numeric_cols = df.select_dtypes(include="number").columns
+                if numeric_cols.any():
+                    return df[numeric_cols].mean().to_dict()
+            
+            # Check for plot request
+            if "scatterplot" in key_lower or "plot" in key_lower:
+                numeric_cols = df.select_dtypes(include="number").columns
+                if len(numeric_cols) >= 2:
+                    return generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
     return None  # fallback to AI
 
 async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
