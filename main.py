@@ -6,35 +6,15 @@ import io
 import base64
 import matplotlib.pyplot as plt
 import seaborn as sns
-import json
+import openai
 
-from util import scrape_table_from_url, analyze_question, parse_questions, collect_all_keys
-from openai import OpenAI
+from util import scrape_table_from_url, analyze_question, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
-openai_client = OpenAI()  # assumes API key is set in environment
 
-async def ai_infer_keys_batch(questions: list) -> list:
-    if not questions:
-        return []
-    prompt = "For each of the following questions, suggest a short, descriptive, snake_case key name:\n"
-    for i, q in enumerate(questions, 1):
-        prompt += f"{i}. {q}\n"
-    prompt += "\nReturn only a JSON array of strings, one key per question."
-
-    resp = await openai_client.chat.completions.acreate(
-        model="gpt-5-mini",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=100
-    )
-    content = resp.choices[0].message.content.strip()
-    try:
-        keys = json.loads(content)
-        keys = [k.lower().replace(" ", "_").replace("-", "_") for k in keys]
-    except:
-        keys = [f"q{i+1}" for i in range(len(questions))]
-    return keys
-
+# =========================
+# Local plotting utility
+# =========================
 def generate_scatterplot(df, x_col, y_col):
     df = df.copy()
     df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
@@ -63,20 +43,35 @@ def find_rank_peak_df(dataframes: dict):
                        df.columns[cols.index("rank")], df.columns[cols.index("peak")]
     return None, None, None
 
+# =========================
+# AI utilities
+# =========================
+def ai_infer_key(question: str) -> str:
+    prompt = f"Suggest the most probable JSON key name (single string) for this question: \"{question}\""
+    resp = openai.ChatCompletion.create(
+        model="gpt-5-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=10
+    )
+    return resp.choices[0].message['content'].strip()
+
+def ai_analyze_question(question: str, dataframes: dict, raw_files: dict):
+    return analyze_question(question, dataframes, raw_files)
+
+# =========================
+# API endpoint (array only)
+# =========================
 @app.post("/api/")
 async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(None),
                   files: Optional[List[UploadFile]] = None):
     try:
-        # Step 1: Read request
-        body = {}
-        if request.headers.get("content-type", "").startswith("application/json"):
-            body = await request.json()
-
+        # Step 1: Read questions
         questions_content = ""
         if questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
-        elif "request" in body:
-            questions_content = body.get("request", "").strip()
+        elif request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+            questions_content = body.get("request", "").strip() if "request" in body else ""
 
         questions, urls = parse_questions(questions_content)
 
@@ -91,31 +86,23 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
                     uploaded_data[f.filename] = content
 
         # Step 3: Scrape URLs
-        dataframes = {}
-        for url in urls:
-            df = scrape_table_from_url(url)
-            dataframes[url] = df
+        dataframes = {url: scrape_table_from_url(url) for url in urls}
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 4: AI key inference
-        inferred_keys = await ai_infer_keys_batch(questions)
-
-        # Step 5: Analyze questions
+        # Step 4: AI-driven analysis
         answers_array = []
         for q in questions:
-            answer = analyze_question(q, dataframes, uploaded_data)
-            if answer is None:
-                answer = 0 if q.lower().startswith(("total", "average", "median", "min", "max")) else ""
-            answers_array.append(answer)
+            _ = ai_infer_key(q)  # key is inferred but not returned
+            value = ai_analyze_question(q, dataframes, uploaded_data)
+            answers_array.append(value)
 
-        # Step 6: Generate scatterplot as last element
+        # Step 5: Scatterplot
         scatter_df, rank_col, peak_col = find_rank_peak_df(dataframes)
         if scatter_df is not None:
-            answers_array.append(generate_scatterplot(scatter_df, rank_col, peak_col))
-        else:
-            answers_array.append("data:image/png;base64,")
+            scatter_img = generate_scatterplot(scatter_df, rank_col, peak_col)
+            answers_array.append(scatter_img)
 
         return JSONResponse(answers_array)
 
