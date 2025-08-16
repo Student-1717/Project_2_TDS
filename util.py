@@ -13,9 +13,14 @@ def scrape_table_from_url(url):
     try:
         response = requests.get(url)
         response.raise_for_status()
-        tables = pd.read_html(response.text)
+
+        # Use StringIO to safely parse literal HTML
+        tables = pd.read_html(io.StringIO(response.text))
         for table in tables:
             if not table.empty:
+                # Convert numeric-like columns safely
+                for col in table.columns:
+                    table[col] = pd.to_numeric(table[col], errors='ignore')
                 return table
     except Exception as e:
         print(f"Failed to scrape {url}: {e}")
@@ -27,38 +32,46 @@ def extract_keys_from_url_data(url, df):
     Generate possible evaluator keys from:
       1. URL path
       2. Table column names
-      3. 'Rank' / 'Title' style column headers
+      3. Known useful headers like 'Rank', 'Title', etc.
     """
     keys = set()
 
-    # 1. From URL
+    # 1. From URL path
     try:
         parsed = urlparse(url)
         if parsed.path:
             path_parts = [p for p in parsed.path.split("/") if p]
-            for part in path_parts:
-                keys.add(part.lower().replace(" ", "_"))
+            keys.update([p.lower().replace(" ", "_") for p in path_parts])
     except Exception:
         pass
 
     # 2. From table columns
     if isinstance(df, pd.DataFrame) and not df.empty:
-        for col in df.columns:
-            keys.add(str(col).lower().strip().replace(" ", "_"))
+        keys.update([str(col).lower().strip().replace(" ", "_") for col in df.columns])
 
-    # 3. From specific known useful headers
+    # 3. From specific useful headers
     for col in df.columns:
-        if "rank" in str(col).lower() or "title" in str(col).lower():
-            keys.add(str(col).lower().replace(" ", "_"))
+        col_lower = str(col).lower()
+        if "rank" in col_lower or "title" in col_lower or "peak" in col_lower:
+            keys.add(col_lower.replace(" ", "_"))
 
     return list(keys)
 
 # ---------------- Plotting ----------------
 def plot_scatter_base64(df, x_col, y_col, regression=True, save_path=None):
-    plt.figure(figsize=(6,4))
+    """Create scatterplot with optional regression line and return base64 PNG."""
+    # Ensure numeric
+    df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
+    df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
+    df = df.dropna(subset=[x_col, y_col])
+
+    if df.empty:
+        return "No numeric data available for scatterplot"
+
+    plt.figure(figsize=(6, 4))
     sns.scatterplot(x=x_col, y=y_col, data=df)
     if regression:
-        sns.regplot(x=x_col, y=y_col, data=df, scatter=False, color='red')
+        sns.regplot(x=x_col, y=y_col, data=df, scatter=False, color='red', line_kws={"linestyle":"dotted"})
     plt.xlabel(x_col)
     plt.ylabel(y_col)
     plt.tight_layout()
@@ -66,7 +79,7 @@ def plot_scatter_base64(df, x_col, y_col, regression=True, save_path=None):
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=80)
     if save_path:
-        plt.savefig(save_path, dpi=80)  # save to disk
+        plt.savefig(save_path, dpi=80)
     plt.close()
     buf.seek(0)
     encoded = base64.b64encode(buf.read()).decode('utf-8')
@@ -74,6 +87,7 @@ def plot_scatter_base64(df, x_col, y_col, regression=True, save_path=None):
 
 # ---------------- Question Parser ----------------
 def parse_questions(content):
+    """Separate questions and URLs from uploaded text."""
     questions = []
     urls = []
     for line in content.splitlines():
@@ -88,21 +102,25 @@ def parse_questions(content):
 
 # ---------------- Analyzer ----------------
 def analyze_question(question, dataframes, uploaded_data=None):
+    """
+    Analyze a single question based on numeric columns in dataframes.
+    Handles counts, sums, averages, correlations, and scatterplots.
+    """
     question_lower = question.lower()
     df = None
 
-    # Choose first numeric dataframe
+    # Pick first numeric dataframe
     for df_candidate in dataframes.values():
         if not df_candidate.empty and any(np.issubdtype(dt, np.number) for dt in df_candidate.dtypes):
             df = df_candidate
             break
 
     if df is None:
-        return "No data"
+        return "No data available"
 
     numeric_cols = df.select_dtypes(include=np.number).columns
     if len(numeric_cols) == 0:
-        return "No numeric data"
+        return "No numeric columns available"
 
     # Basic computations
     if "how many" in question_lower:
@@ -118,22 +136,21 @@ def analyze_question(question, dataframes, uploaded_data=None):
         if len(numeric_cols) >= 2:
             return float(df[numeric_cols[0]].corr(df[numeric_cols[1]]))
         else:
-            return "Not enough numeric columns"
+            return "Not enough numeric columns for correlation"
 
     elif "plot" in question_lower or "scatter" in question_lower:
         if len(numeric_cols) >= 2:
-            # Return Base64 image
             return plot_scatter_base64(df, numeric_cols[0], numeric_cols[1])
         else:
-            return "Not enough numeric columns"
+            return "Not enough numeric columns for scatterplot"
 
     else:
-        return "Not implemented"
+        return "Question type not implemented"
 
 # ---------------- Utility to collect all keys ----------------
 def collect_all_keys(urls, dataframes):
     """
-    Collect keys from all URLs and DataFrames for evaluator mapping
+    Collect keys from all URLs and DataFrames for evaluator mapping.
     """
     all_keys = set()
     for url in urls:
