@@ -99,6 +99,12 @@ def extract_keys_from_questions(txt):
     pattern = r"- `([^`]+)`"
     return re.findall(pattern, txt)
 
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TDS_API")
+
 @app.post("/api/")
 async def analyze(request: Request,
                   questions_txt: Optional[UploadFile] = File(None),
@@ -107,55 +113,75 @@ async def analyze(request: Request,
         # --- Step 1: Read questions ---
         questions_content = ""
         if questions_txt:
+            await questions_txt.seek(0)
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
+            logger.info(f"Questions file content length: {len(questions_content)}")
         else:
             body = await request.json()
             questions_content = body.get("request", "").strip()
+            logger.info(f"Questions from JSON length: {len(questions_content)}")
 
+        if not questions_content:
+            logger.warning("No questions content provided!")
+
+        # --- Step 2: Parse questions and URLs ---
         questions, urls = parse_questions(questions_content)
+        logger.info(f"Parsed questions: {questions}")
+        logger.info(f"Parsed URLs: {urls}")
 
-        # --- Step 2: Process uploaded files ---
+        # --- Step 3: Process uploaded files ---
         uploaded_data = {}
         if files:
             for f in files:
+                await f.seek(0)
                 content = await f.read()
+                logger.info(f"Processing uploaded file: {f.filename}, size: {len(content)} bytes")
                 if f.filename.endswith(".csv"):
                     try:
                         uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
-                    except Exception:
+                        logger.info(f"CSV loaded with shape: {uploaded_data[f.filename].shape}")
+                    except Exception as e:
                         uploaded_data[f.filename] = None
+                        logger.warning(f"Failed to read CSV {f.filename}: {e}")
                 else:
                     uploaded_data[f.filename] = content
 
-        # --- Step 3: Scrape URLs ---
+        # --- Step 4: Scrape URLs ---
         dataframes = {}
         for url in urls:
             try:
                 df = scrape_table_from_url(url)
                 dataframes[url] = df
-            except Exception:
+                logger.info(f"Scraped URL {url} with shape: {df.shape}")
+            except Exception as e:
                 dataframes[url] = None
+                logger.warning(f"Failed to scrape URL {url}: {e}")
 
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # --- Step 4: Extract keys dynamically ---
+        # --- Step 5: Extract keys dynamically ---
         expected_keys = extract_keys_from_questions(questions_content)
+        logger.info(f"Extracted keys: {expected_keys}")
+        if not expected_keys:
+            logger.warning("No keys extracted! Check question formatting (backticks `key`).")
+
         answers_dict = {key: "N/A" for key in expected_keys}
 
-        # --- Step 5: Generate values for each key ---
+        # --- Step 6: Generate values for each key ---
         for key in expected_keys:
-            # First try local computation
             local_val = compute_local_value(key, dataframes)
             if local_val is not None:
                 answers_dict[key] = local_val
+                logger.info(f"Local computation for '{key}': {local_val}")
             else:
-                # fallback to AI
                 ai_val = await ai_generate_value_for_key(key, questions_content, dataframes)
                 answers_dict[key] = ai_val
+                logger.info(f"AI computation for '{key}': {ai_val}")
 
         return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
 
     except Exception as e:
+        logger.error(f"Error in /api/: {e}", exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
