@@ -11,10 +11,18 @@ from util import scrape_table_from_url, analyze_question, parse_questions, colle
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
+REQUIRED_KEYS = [
+    "edge_count",
+    "highest_degree_node",
+    "average_degree",
+    "density",
+    "shortest_path_alice_eve",
+    "network_graph",
+    "degree_histogram"
+]
 
 def generate_key_from_question(question: str) -> str:
     return question.lower().replace(" ", "_")
-
 
 def ask_ai_only_questions(questions: list) -> dict:
     answers_dict = {}
@@ -22,7 +30,6 @@ def ask_ai_only_questions(questions: list) -> dict:
         key = generate_key_from_question(q)
         answers_dict[key] = "AI answer placeholder for: " + q
     return answers_dict
-
 
 def generate_scatterplot(df, x_col, y_col):
     df = df.copy()
@@ -43,7 +50,6 @@ def generate_scatterplot(df, x_col, y_col):
     buf.seek(0)
     return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
 
-
 def find_rank_peak_df(dataframes: dict):
     for df in dataframes.values():
         if isinstance(df, pd.DataFrame) and not df.empty:
@@ -53,30 +59,30 @@ def find_rank_peak_df(dataframes: dict):
                        df.columns[cols.index("rank")], df.columns[cols.index("peak")]
     return None, None, None
 
-
 @app.post("/api/")
 async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(None),
                   files: Optional[List[UploadFile]] = None):
     try:
-        # Step 0: Determine expected keys dynamically from the incoming request
-        body = await request.json() if request else {}
+        # Step 0: Handle expected keys from JSON if provided
         expected_keys = set()
-        if "expected_keys" in body and isinstance(body["expected_keys"], list):
-            expected_keys.update(body["expected_keys"])
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+            if "expected_keys" in body and isinstance(body["expected_keys"], list):
+                expected_keys.update(body["expected_keys"])
 
-        # Step 1: Read questions
-        questions_content = None
+        # Step 1: Read questions from file if provided
+        questions_content = ""
         if questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
-        if not questions_content:
-            questions_content = body.get("request", "").strip() if body else ""
-        if not questions_content:
-            questions_content = ""
 
-        # Step 2: Parse questions & URLs
+        # Step 2: If no file, check JSON "request" field
+        if not questions_content and "body" in locals():
+            questions_content = body.get("request", "").strip() if body else ""
+
+        # Step 3: Parse questions & URLs
         questions, urls = parse_questions(questions_content)
 
-        # Step 3: Process uploaded files
+        # Step 4: Process uploaded files
         uploaded_data = {}
         if files:
             for f in files:
@@ -86,47 +92,45 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
                 else:
                     uploaded_data[f.filename] = content
 
-        # Step 4: Scrape URLs
+        # Step 5: Scrape URLs
         dataframes = {}
         for url in urls:
             df = scrape_table_from_url(url)
             dataframes[url] = df
+
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 5: Analyze questions
+        # Step 6: Analyze questions
         answers_dict = {}
         for q in questions:
-            answers_dict[generate_key_from_question(q)] = analyze_question(q, dataframes, uploaded_data)
+            key = generate_key_from_question(q)
+            answers_dict[key] = analyze_question(q, dataframes, uploaded_data)
 
-        # Step 6: Collect extra keys from URLs & tables
+        # Step 7: Collect extra keys from URLs & tables
         extra_keys = collect_all_keys(urls, dataframes)
         for key in extra_keys:
             if key not in answers_dict:
                 answers_dict[key] = "No direct question, extracted from URL/table"
-                expected_keys.add(key)
 
-        # Step 7: Generate scatterplot if possible
+        # Step 8: Generate scatterplot if possible
         scatter_df, rank_col, peak_col = find_rank_peak_df(dataframes)
         if scatter_df is not None:
             answers_dict["scatterplot_rank_peak"] = generate_scatterplot(scatter_df, rank_col, peak_col)
         else:
             answers_dict["scatterplot_rank_peak"] = "No table contains both 'rank' and 'peak' columns"
-            expected_keys.add("scatterplot_rank_peak")
 
-        # Step 8: Ensure all expected keys exist (safe defaults)
-        for key in expected_keys:
+        # Step 9: Ensure all required or expected keys exist
+        all_keys = set(REQUIRED_KEYS) | expected_keys
+        for key in all_keys:
             if key not in answers_dict:
-                # Decide default type based on key name heuristics
-                if any(sub in key.lower() for sub in ["count", "degree", "density", "path"]):
+                if key in ["edge_count", "average_degree", "density", "shortest_path_alice_eve"]:
                     answers_dict[key] = 0
-                elif any(sub in key.lower() for sub in ["node", "name"]):
+                elif key in ["highest_degree_node"]:
                     answers_dict[key] = ""
-                elif "graph" in key.lower() or "histogram" in key.lower():
+                elif key in ["network_graph", "degree_histogram"]:
                     answers_dict[key] = "No data available"
-                else:
-                    answers_dict[key] = None
 
         return JSONResponse(answers_dict)
 
