@@ -11,18 +11,10 @@ from util import scrape_table_from_url, analyze_question, parse_questions, colle
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-REQUIRED_KEYS = [
-    "edge_count",
-    "highest_degree_node",
-    "average_degree",
-    "density",
-    "shortest_path_alice_eve",
-    "network_graph",
-    "degree_histogram"
-]
 
 def generate_key_from_question(question: str) -> str:
     return question.lower().replace(" ", "_")
+
 
 def ask_ai_only_questions(questions: list) -> dict:
     answers_dict = {}
@@ -30,6 +22,7 @@ def ask_ai_only_questions(questions: list) -> dict:
         key = generate_key_from_question(q)
         answers_dict[key] = "AI answer placeholder for: " + q
     return answers_dict
+
 
 def generate_scatterplot(df, x_col, y_col):
     df = df.copy()
@@ -50,6 +43,7 @@ def generate_scatterplot(df, x_col, y_col):
     buf.seek(0)
     return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
 
+
 def find_rank_peak_df(dataframes: dict):
     for df in dataframes.values():
         if isinstance(df, pd.DataFrame) and not df.empty:
@@ -59,18 +53,23 @@ def find_rank_peak_df(dataframes: dict):
                        df.columns[cols.index("rank")], df.columns[cols.index("peak")]
     return None, None, None
 
+
 @app.post("/api/")
 async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(None),
                   files: Optional[List[UploadFile]] = None):
     try:
+        # Step 0: Determine expected keys dynamically from the incoming request
+        body = await request.json() if request else {}
+        expected_keys = set()
+        if "expected_keys" in body and isinstance(body["expected_keys"], list):
+            expected_keys.update(body["expected_keys"])
+
         # Step 1: Read questions
         questions_content = None
         if questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
         if not questions_content:
-            body = await request.json()
-            questions_content = body.get("request", "").strip() if body else None
-
+            questions_content = body.get("request", "").strip() if body else ""
         if not questions_content:
             questions_content = ""
 
@@ -92,7 +91,6 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
         for url in urls:
             df = scrape_table_from_url(url)
             dataframes[url] = df
-
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
@@ -107,6 +105,7 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
         for key in extra_keys:
             if key not in answers_dict:
                 answers_dict[key] = "No direct question, extracted from URL/table"
+                expected_keys.add(key)
 
         # Step 7: Generate scatterplot if possible
         scatter_df, rank_col, peak_col = find_rank_peak_df(dataframes)
@@ -114,17 +113,20 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
             answers_dict["scatterplot_rank_peak"] = generate_scatterplot(scatter_df, rank_col, peak_col)
         else:
             answers_dict["scatterplot_rank_peak"] = "No table contains both 'rank' and 'peak' columns"
+            expected_keys.add("scatterplot_rank_peak")
 
-        # Step 8: Ensure all required keys exist (use defaults if missing)
-        for key in REQUIRED_KEYS:
+        # Step 8: Ensure all expected keys exist (safe defaults)
+        for key in expected_keys:
             if key not in answers_dict:
-                # Safe defaults
-                if key in ["edge_count", "average_degree", "density", "shortest_path_alice_eve"]:
+                # Decide default type based on key name heuristics
+                if any(sub in key.lower() for sub in ["count", "degree", "density", "path"]):
                     answers_dict[key] = 0
-                elif key in ["highest_degree_node"]:
+                elif any(sub in key.lower() for sub in ["node", "name"]):
                     answers_dict[key] = ""
-                elif key in ["network_graph", "degree_histogram"]:
+                elif "graph" in key.lower() or "histogram" in key.lower():
                     answers_dict[key] = "No data available"
+                else:
+                    answers_dict[key] = None
 
         return JSONResponse(answers_dict)
 
