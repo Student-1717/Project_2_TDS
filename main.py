@@ -8,6 +8,7 @@ import base64
 import matplotlib.pyplot as plt
 import seaborn as sns
 from openai import OpenAI
+import json
 
 from util import scrape_table_from_url, parse_questions
 
@@ -53,7 +54,6 @@ If the key requires a plot, suggest 'scatterplot' or another type of plot.
             messages=[{"role": "user", "content": prompt}]
         )
         content = response.choices[0].message.content
-        import json
         result = json.loads(content)
         return result.get("value", "N/A")
     except Exception:
@@ -113,13 +113,12 @@ async def analyze(request: Request,
             except Exception:
                 expected_keys = []
 
+        # Initialize dictionary with YAML keys as None
+        answers_dict = {key: None for key in expected_keys}
+
         # --- Step 5: Generate AI-driven values for each key ---
-        answers_dict = {}
         for key in expected_keys:
-            try:
-                value = await ai_generate_value_for_key(key, questions_content, dataframes)
-            except Exception:
-                value = "N/A"
+            value = await ai_generate_value_for_key(key, questions_content, dataframes)
 
             # Auto-detect plot requests and generate locally if needed
             if isinstance(value, str) and "plot" in value.lower():
