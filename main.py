@@ -6,6 +6,7 @@ import io
 import base64
 import matplotlib.pyplot as plt
 import seaborn as sns
+import networkx as nx
 
 from util import scrape_table_from_url, analyze_question, parse_questions, collect_all_keys
 
@@ -36,8 +37,7 @@ def generate_scatterplot(df, x_col, y_col):
         return "No numeric data available for scatterplot"
 
     plt.figure(figsize=(6, 4))
-    sns.regplot(x=x_col, y=y_col, data=df, scatter=True,
-                line_kws={"color": "red", "linestyle": "dotted"})
+    sns.regplot(x=x_col, y=y_col, data=df, scatter=True, line_kws={"color": "red", "linestyle": "dotted"})
     plt.xlabel(x_col)
     plt.ylabel(y_col)
     plt.tight_layout()
@@ -57,6 +57,56 @@ def find_rank_peak_df(dataframes: dict):
                 return df[[df.columns[cols.index("rank")], df.columns[cols.index("peak")]]], \
                        df.columns[cols.index("rank")], df.columns[cols.index("peak")]
     return None, None, None
+
+
+def build_network_graph(dataframes: dict):
+    """Combine all tables with 'source' and 'target' columns into a NetworkX graph and compute metrics."""
+    combined_df = pd.DataFrame()
+    for df in dataframes.values():
+        if isinstance(df, pd.DataFrame):
+            cols = [c.lower().strip() for c in df.columns]
+            if "source" in cols and "target" in cols:
+                combined_df = pd.concat([combined_df, df[[df.columns[cols.index("source")], df.columns[cols.index("target")]]]])
+
+    if combined_df.empty:
+        return None
+
+    combined_df = combined_df.dropna()
+    G = nx.from_pandas_edgelist(combined_df, source=combined_df.columns[0], target=combined_df.columns[1])
+    
+    # Metrics
+    metrics = {
+        "edge_count": G.number_of_edges(),
+        "highest_degree_node": max(dict(G.degree()).items(), key=lambda x: x[1])[0] if G.number_of_nodes() > 0 else None,
+        "average_degree": sum(dict(G.degree()).values()) / G.number_of_nodes() if G.number_of_nodes() > 0 else None,
+        "density": nx.density(G),
+        "shortest_path_alice_eve": nx.shortest_path_length(G, source="Alice", target="Eve") if "Alice" in G.nodes and "Eve" in G.nodes else None
+    }
+
+    # Graph visualization
+    plt.figure(figsize=(6, 4))
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_color='skyblue', edge_color='gray', node_size=500)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    plt.close()
+    buf.seek(0)
+    metrics["network_graph"] = f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
+    # Degree histogram
+    degrees = [d for n, d in G.degree()]
+    plt.figure(figsize=(6, 4))
+    plt.hist(degrees, bins=range(1, max(degrees) + 2), color='skyblue', edgecolor='black')
+    plt.xlabel("Degree")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    plt.close()
+    buf.seek(0)
+    metrics["degree_histogram"] = f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
+    return metrics
 
 
 @app.post("/api/")
@@ -117,11 +167,20 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
         else:
             answers_dict["scatterplot_rank_peak"] = "No table contains both 'rank' and 'peak' columns"
 
-        # ---------------- Step 8: AI-only questions placeholder ----------------
-        ai_answers = ask_ai_only_questions(questions)
-        for k, v in ai_answers.items():
-            if k not in answers_dict:
-                answers_dict[k] = v
+        # ---------------- Step 8: Build network graph ----------------
+        network_metrics = build_network_graph(dataframes)
+        if network_metrics:
+            answers_dict.update(network_metrics)
+        else:
+            answers_dict.update({
+                "edge_count": 0,
+                "highest_degree_node": None,
+                "average_degree": None,
+                "density": 0,
+                "shortest_path_alice_eve": None,
+                "network_graph": "No network graph data available",
+                "degree_histogram": "No network graph data available"
+            })
 
         return JSONResponse(answers_dict)
 
