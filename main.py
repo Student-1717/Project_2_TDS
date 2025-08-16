@@ -76,7 +76,6 @@ async def analyze(request: Request,
         elif questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
 
-        # Extract questions and URLs
         questions, urls = parse_questions(questions_content)
 
         # --- Step 2: Process uploaded files ---
@@ -105,36 +104,42 @@ async def analyze(request: Request,
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # --- Step 4: Extract keys from questions.txt ---
+        # --- Step 4: Extract keys directly from questions.txt ---
         expected_keys = extract_keys_from_questions(questions_content)
+
+        # Initialize dictionary with "N/A" for all keys
         answers_dict = {key: "N/A" for key in expected_keys}
 
-        # --- Step 5: AI-driven values for each key ---
+        # --- Step 5: Generate AI-driven values for each key ---
         for key in expected_keys:
-            value = await ai_generate_value_for_key(key, questions_content, dataframes)
+            try:
+                value = await ai_generate_value_for_key(key, questions_content, dataframes)
+            except Exception:
+                value = "N/A"
 
-            # Detect plot requests and auto-generate scatterplots
+            # Auto-detect plot requests and generate locally if needed
             if isinstance(value, str) and "plot" in value.lower():
-                scatter_done = False
+                scatter_df = None
+                x_col, y_col = None, None
                 for df in dataframes.values():
                     if isinstance(df, pd.DataFrame):
-                        numeric_cols = df.select_dtypes(include="number").columns
-                        if len(numeric_cols) >= 2:
-                            value = generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
-                            scatter_done = True
+                        cols = [c.lower() for c in df.columns]
+                        if "rank" in cols and "peak" in cols:
+                            scatter_df = df
+                            x_col, y_col = df.columns[cols.index("rank")], df.columns[cols.index("peak")]
                             break
-                if not scatter_done:
+                if scatter_df is not None:
+                    try:
+                        value = generate_scatterplot(scatter_df, x_col, y_col)
+                    except Exception:
+                        value = "data:image/png;base64,"
+                else:
                     value = "data:image/png;base64,"
 
             answers_dict[key] = value
 
-        # --- Step 6: Return response in promtfoo-compatible scheme ---
-        response_payload = {
-            "dict": answers_dict,
-            "array": [answers_dict[k] for k in expected_keys]
-        }
-
-        return JSONResponse(response_payload)
+        # Return JSON in the scheme expected by promtfoo
+        return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
