@@ -53,33 +53,8 @@ def extract_keys_from_url_data(url, df):
 
     return list(keys)
 
-# ---------------- Collect All Keys ----------------
-def collect_all_keys(dataframes):
-    """
-    Collect keys for all DataFrames in the format:
-      {url: [keys]}
-    """
-    all_keys = {}
-    for url, df in dataframes.items():
-        keys = extract_keys_from_url_data(url, df)
-
-        # Add standard numeric keys
-        numeric_cols = df.select_dtypes(include=np.number).columns
-        for col in numeric_cols:
-            keys.add(f"{col}_count")
-            keys.add(f"{col}_sum")
-            keys.add(f"{col}_mean")
-        # Add correlation keys if 2+ numeric columns
-        if len(numeric_cols) >= 2:
-            for i in range(len(numeric_cols)):
-                for j in range(i + 1, len(numeric_cols)):
-                    keys.add(f"{numeric_cols[i]}_{numeric_cols[j]}_correlation")
-
-        all_keys[url] = list(keys)
-    return all_keys
-
 # ---------------- Plotting ----------------
-def plot_scatter_base64(df, x_col, y_col, regression=True):
+def plot_scatter_base64(df, x_col, y_col, regression=True, save_path=None):
     plt.figure(figsize=(6,4))
     sns.scatterplot(x=x_col, y=y_col, data=df)
     if regression:
@@ -87,8 +62,11 @@ def plot_scatter_base64(df, x_col, y_col, regression=True):
     plt.xlabel(x_col)
     plt.ylabel(y_col)
     plt.tight_layout()
+
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=80)
+    if save_path:
+        plt.savefig(save_path, dpi=80)  # save to disk
     plt.close()
     buf.seek(0)
     encoded = base64.b64encode(buf.read()).decode('utf-8')
@@ -108,72 +86,58 @@ def parse_questions(content):
             questions.append(line)
     return questions, urls
 
-# ---------------- Analyzer (Updated) ----------------
-def analyze_question(question, dataframes, all_keys=None):
-    """
-    Analyze a question using available DataFrames and collected keys.
-    - question: string
-    - dataframes: {url: df}
-    - all_keys: {url: [keys]}
-    """
+# ---------------- Analyzer ----------------
+def analyze_question(question, dataframes, uploaded_data=None):
     question_lower = question.lower()
+    df = None
 
-    # Try each DataFrame in order
-    for url, df in dataframes.items():
-        if df.empty:
-            continue
+    # Choose first numeric dataframe
+    for df_candidate in dataframes.values():
+        if not df_candidate.empty and any(np.issubdtype(dt, np.number) for dt in df_candidate.dtypes):
+            df = df_candidate
+            break
 
-        numeric_cols = df.select_dtypes(include=np.number).columns
-        keys = set(all_keys.get(url, [])) if all_keys else set()
+    if df is None:
+        return "No data"
 
-        # Map question keywords to numeric operations
-        if "how many" in question_lower:
-            for col in numeric_cols:
-                key = f"{col}_count"
-                if key in keys:
-                    return int(df[col].count())
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    if len(numeric_cols) == 0:
+        return "No numeric data"
 
-        elif "sum" in question_lower:
-            for col in numeric_cols:
-                key = f"{col}_sum"
-                if key in keys:
-                    return float(df[col].sum())
+    # Basic computations
+    if "how many" in question_lower:
+        return int(df[numeric_cols[0]].count())
 
-        elif "average" in question_lower or "mean" in question_lower:
-            for col in numeric_cols:
-                key = f"{col}_mean"
-                if key in keys:
-                    return float(df[col].mean())
+    elif "sum" in question_lower:
+        return float(df[numeric_cols[0]].sum())
 
-        elif "correlation" in question_lower:
-            if len(numeric_cols) >= 2:
-                col1, col2 = numeric_cols[:2]
-                key = f"{col1}_{col2}_correlation"
-                if key in keys:
-                    return float(df[col1].corr(df[col2]))
-            return "Not enough numeric columns"
+    elif "average" in question_lower or "mean" in question_lower:
+        return float(df[numeric_cols[0]].mean())
 
-        elif "plot" in question_lower:
-            if len(numeric_cols) >= 2:
-                col1, col2 = numeric_cols[:2]
-                return plot_scatter_base64(df, col1, col2)
-            return "Not enough numeric columns"
-
+    elif "correlation" in question_lower:
+        if len(numeric_cols) >= 2:
+            return float(df[numeric_cols[0]].corr(df[numeric_cols[1]]))
         else:
-            # Try matching any known key from all_keys
-            for key in keys:
-                if key in question_lower:
-                    if key.endswith("_count"):
-                        col = key[:-6]
-                        return int(df[col].count())
-                    elif key.endswith("_sum"):
-                        col = key[:-4]
-                        return float(df[col].sum())
-                    elif key.endswith("_mean"):
-                        col = key[:-5]
-                        return float(df[col].mean())
-                    elif "_correlation" in key:
-                        col1, col2 = key.split("_")[:2]
-                        return float(df[col1].corr(df[col2]))
+            return "Not enough numeric columns"
 
-    return "No matching data found"
+    elif "plot" in question_lower or "scatter" in question_lower:
+        if len(numeric_cols) >= 2:
+            # Return Base64 image
+            return plot_scatter_base64(df, numeric_cols[0], numeric_cols[1])
+        else:
+            return "Not enough numeric columns"
+
+    else:
+        return "Not implemented"
+
+# ---------------- Utility to collect all keys ----------------
+def collect_all_keys(urls, dataframes):
+    """
+    Collect keys from all URLs and DataFrames for evaluator mapping
+    """
+    all_keys = set()
+    for url in urls:
+        df = dataframes.get(url, pd.DataFrame())
+        keys = extract_keys_from_url_data(url, df)
+        all_keys.update(keys)
+    return list(all_keys)
