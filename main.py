@@ -116,12 +116,12 @@ async def analyze(request: Request,
             await questions_txt.seek(0)
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
             logger.info(f"Questions file content length: {len(questions_content)}")
-        else:
+        elif request.headers.get("content-type", "").startswith("application/json"):
+            # Only try to read JSON if no file is uploaded
             body = await request.json()
             questions_content = body.get("request", "").strip()
             logger.info(f"Questions from JSON length: {len(questions_content)}")
-
-        if not questions_content:
+        else:
             logger.warning("No questions content provided!")
 
         # --- Step 2: Parse questions and URLs ---
@@ -157,6 +157,7 @@ async def analyze(request: Request,
                 dataframes[url] = None
                 logger.warning(f"Failed to scrape URL {url}: {e}")
 
+        # Merge uploaded CSVs
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
