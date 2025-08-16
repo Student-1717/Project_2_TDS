@@ -8,7 +8,7 @@ import base64
 import matplotlib.pyplot as plt
 import seaborn as sns
 from openai import OpenAI
-import json
+import re
 
 from util import scrape_table_from_url, parse_questions
 
@@ -54,16 +54,25 @@ If the key requires a plot, suggest 'scatterplot' or another type of plot.
             messages=[{"role": "user", "content": prompt}]
         )
         content = response.choices[0].message.content
+        import json
         result = json.loads(content)
         return result.get("value", "N/A")
     except Exception:
         return "N/A"
 
+def extract_keys_from_questions(txt):
+    """
+    Parses the questions text to extract all keys in backticks.
+    Example line: - `edge_count`: number
+    Returns a list of keys like ['edge_count', 'highest_degree_node', ...]
+    """
+    pattern = r"- `([^`]+)`"
+    return re.findall(pattern, txt)
+
 @app.post("/api/")
 async def analyze(request: Request,
                   questions_txt: Optional[UploadFile] = File(None),
-                  files: Optional[List[UploadFile]] = None,
-                  yaml_file: Optional[UploadFile] = File(None)):
+                  files: Optional[List[UploadFile]] = None):
 
     try:
         # --- Step 1: Read questions ---
@@ -74,6 +83,7 @@ async def analyze(request: Request,
             questions_content = body.get("request", "").strip()
         elif questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
+
         questions, urls = parse_questions(questions_content)
 
         # --- Step 2: Process uploaded files ---
@@ -102,23 +112,18 @@ async def analyze(request: Request,
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # --- Step 4: Load YAML keys dynamically ---
-        expected_keys = []
-        parsed_yaml = {}
-        if yaml_file:
-            try:
-                yaml_content = (await yaml_file.read()).decode("utf-8")
-                parsed_yaml = yaml.safe_load(yaml_content) or {}
-                expected_keys = list(parsed_yaml.get("properties", {}).keys())
-            except Exception:
-                expected_keys = []
+        # --- Step 4: Extract keys directly from questions.txt ---
+        expected_keys = extract_keys_from_questions(questions_content)
 
-        # Initialize dictionary with YAML keys as None
-        answers_dict = {key: None for key in expected_keys}
+        # Initialize dictionary with None or "N/A" for all keys
+        answers_dict = {key: "N/A" for key in expected_keys}
 
         # --- Step 5: Generate AI-driven values for each key ---
         for key in expected_keys:
-            value = await ai_generate_value_for_key(key, questions_content, dataframes)
+            try:
+                value = await ai_generate_value_for_key(key, questions_content, dataframes)
+            except Exception:
+                value = "N/A"
 
             # Auto-detect plot requests and generate locally if needed
             if isinstance(value, str) and "plot" in value.lower():
