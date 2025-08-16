@@ -22,14 +22,12 @@ def ask_ai_only_questions(questions: list) -> dict:
     answers_dict = {}
     for q in questions:
         key = generate_key_from_question(q)
-        # Here you can integrate with OpenAI if needed
         answers_dict[key] = "AI answer placeholder for: " + q
     return answers_dict
 
 
 def generate_scatterplot(df, x_col, y_col):
     """Generate a scatterplot with regression and return base64 string."""
-    # Ensure numeric columns
     df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
     df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
     df = df.dropna(subset=[x_col, y_col])
@@ -38,7 +36,8 @@ def generate_scatterplot(df, x_col, y_col):
         return "No numeric data available for scatterplot"
 
     plt.figure(figsize=(6, 4))
-    sns.regplot(x=x_col, y=y_col, data=df, scatter=True, line_kws={"color": "red", "linestyle": "dotted"})
+    sns.regplot(x=x_col, y=y_col, data=df, scatter=True,
+                line_kws={"color": "red", "linestyle": "dotted"})
     plt.xlabel(x_col)
     plt.ylabel(y_col)
     plt.tight_layout()
@@ -117,6 +116,12 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
             answers_dict["scatterplot_rank_peak"] = generate_scatterplot(scatter_df, rank_col, peak_col)
         else:
             answers_dict["scatterplot_rank_peak"] = "No table contains both 'rank' and 'peak' columns"
+
+        # ---------------- Step 8: AI-only questions placeholder ----------------
+        ai_answers = ask_ai_only_questions(questions)
+        for k, v in ai_answers.items():
+            if k not in answers_dict:
+                answers_dict[k] = v
 
         return JSONResponse(answers_dict)
 
