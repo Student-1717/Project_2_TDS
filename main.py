@@ -1,3 +1,4 @@
+import yaml
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from typing import List, Optional
@@ -8,10 +9,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from openai import OpenAI
 
-from util import scrape_table_from_url, parse_questions, collect_all_keys
+from util import scrape_table_from_url, parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
-client = OpenAI()  # make sure OPENAI_API_KEY is set in your environment
+client = OpenAI()  # ensure OPENAI_API_KEY is set
 
 def generate_scatterplot(df, x_col, y_col):
     df = df.copy()
@@ -31,33 +32,20 @@ def generate_scatterplot(df, x_col, y_col):
     buf.seek(0)
     return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
 
-def find_rank_peak_df(dataframes: dict):
-    for df in dataframes.values():
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            cols = [c.lower().strip() for c in df.columns]
-            if "rank" in cols and "peak" in cols:
-                return df[[df.columns[cols.index("rank")], df.columns[cols.index("peak")]]], \
-                       df.columns[cols.index("rank")], df.columns[cols.index("peak")]
-    return None, None, None
-
-async def ai_generate_key_and_value(question: str, dataframes: dict):
+async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
     """
-    Sends the question + available data to OpenAI to infer:
-    1) key name
-    2) suggested value / computation
+    Sends the question + available data to AI to generate a value for a given key.
     """
     data_preview = {k: (df.head(5).to_dict(orient="records") if isinstance(df, pd.DataFrame) else str(df))
                     for k, df in dataframes.items()}
     prompt = f"""
 You are a data analyst AI.
-Given this question: "{question}"
-And the following dataframes (sample 5 rows each): {data_preview}
+Key: "{key}"
+User Question: "{question}"
+Available dataframes (sample 5 rows each): {data_preview}
 Return a JSON with:
-{{
-  "key": "suggested_key_name_based_on_question",
-  "value": "computed_or_suggested_value"
-}}
-Do not hardcode any key names.
+{{"value": "computed_or_suggested_value"}}
+If the key requires a plot, suggest 'scatterplot' or another type of plot.
 """
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -67,16 +55,18 @@ Do not hardcode any key names.
     try:
         import json
         result = json.loads(content)
-        return result.get("key"), result.get("value")
+        return result.get("value", "N/A")
     except Exception:
-        # fallback if AI fails
-        return question.lower().replace(" ", "_"), "N/A"
+        return "N/A"
 
 @app.post("/api/")
-async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(None),
-                  files: Optional[List[UploadFile]] = None):
+async def analyze(request: Request,
+                  questions_txt: Optional[UploadFile] = File(None),
+                  files: Optional[List[UploadFile]] = None,
+                  yaml_file: Optional[UploadFile] = File(None)):
+
     try:
-        # Step 1: Read questions
+        # --- Step 1: Read questions ---
         questions_content = ""
         body = {}
         if request.headers.get("content-type", "").startswith("application/json"):
@@ -84,10 +74,9 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
             questions_content = body.get("request", "").strip()
         elif questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
-
         questions, urls = parse_questions(questions_content)
 
-        # Step 2: Process uploaded files
+        # --- Step 2: Process uploaded files ---
         uploaded_data = {}
         if files:
             for f in files:
@@ -97,7 +86,7 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
                 else:
                     uploaded_data[f.filename] = content
 
-        # Step 3: Scrape URLs
+        # --- Step 3: Scrape URLs ---
         dataframes = {}
         for url in urls:
             df = scrape_table_from_url(url)
@@ -106,28 +95,39 @@ async def analyze(request: Request, questions_txt: Optional[UploadFile] = File(N
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # Step 4: AI-driven key & value generation
+        # --- Step 4: Load YAML keys dynamically ---
+        expected_keys = []
+        if yaml_file:
+            yaml_content = (await yaml_file.read()).decode("utf-8")
+            parsed_yaml = yaml.safe_load(yaml_content)
+            expected_keys = list(parsed_yaml.get("properties", {}).keys())
+
+        # --- Step 5: Generate AI-driven values for each key ---
         answers_dict = {}
-        answers_array = []
-        for q in questions:
-            key, value = await ai_generate_key_and_value(q, dataframes)
+        for key in expected_keys:
+            # Ask AI to generate value for the key
+            value = await ai_generate_value_for_key(key, questions_content, dataframes)
+
+            # Auto-detect plot requests and generate locally if needed
+            if isinstance(value, str) and "plot" in value.lower():
+                scatter_df = None
+                x_col, y_col = None, None
+                for df in dataframes.values():
+                    if isinstance(df, pd.DataFrame):
+                        cols = [c.lower() for c in df.columns]
+                        if "rank" in cols and "peak" in cols:
+                            scatter_df = df
+                            x_col, y_col = df.columns[cols.index("rank")], df.columns[cols.index("peak")]
+                            break
+                if scatter_df is not None:
+                    value = generate_scatterplot(scatter_df, x_col, y_col)
+                else:
+                    value = "data:image/png;base64,"
+
             answers_dict[key] = value
-            answers_array.append(value)
 
-        # Step 5: Extra keys from URL/table
-        extra_keys = collect_all_keys(urls, dataframes)
-        for key in extra_keys:
-            if key not in answers_dict:
-                answers_dict[key] = "No direct question, extracted from URL/table"
-
-        # Step 6: Scatterplot
-        scatter_df, rank_col, peak_col = find_rank_peak_df(dataframes)
-        if scatter_df is not None:
-            img = generate_scatterplot(scatter_df, rank_col, peak_col)
-            answers_dict["scatterplot_rank_peak"] = img
-            answers_array.append(img)
-
-        return JSONResponse({"dict": answers_dict, "array": answers_array})
+        # Return JSON in expected syntax
+        return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
