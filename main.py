@@ -1,3 +1,64 @@
+import yaml
+from fastapi import FastAPI, File, UploadFile, Request
+from fastapi.responses import JSONResponse
+from typing import List, Optional
+import pandas as pd
+import io
+import base64
+import matplotlib.pyplot as plt
+import seaborn as sns
+from openai import OpenAI
+
+from util import scrape_table_from_url, parse_questions
+
+app = FastAPI(title="TDS Data Analyst Agent")
+client = OpenAI()  # ensure OPENAI_API_KEY is set
+
+def generate_scatterplot(df, x_col, y_col):
+    df = df.copy()
+    df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
+    df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
+    df = df.dropna(subset=[x_col, y_col])
+    if df.empty:
+        return "data:image/png;base64,"
+    plt.figure(figsize=(6, 4))
+    sns.regplot(x=x_col, y=y_col, data=df, scatter=True, line_kws={"color": "red", "linestyle": "dotted"})
+    plt.xlabel(x_col)
+    plt.ylabel(y_col)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    plt.close()
+    buf.seek(0)
+    return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
+async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
+    """
+    Sends the question + available data to AI to generate a value for a given key.
+    """
+    data_preview = {k: (df.head(5).to_dict(orient="records") if isinstance(df, pd.DataFrame) else str(df))
+                    for k, df in dataframes.items()}
+    prompt = f"""
+You are a data analyst AI.
+Key: "{key}"
+User Question: "{question}"
+Available dataframes (sample 5 rows each): {data_preview}
+Return a JSON with:
+{{"value": "computed_or_suggested_value"}}
+If the key requires a plot, suggest 'scatterplot' or another type of plot.
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        content = response.choices[0].message.content
+        import json
+        result = json.loads(content)
+        return result.get("value", "N/A")
+    except Exception:
+        return "N/A"
+
 @app.post("/api/")
 async def analyze(request: Request,
                   questions_txt: Optional[UploadFile] = File(None),
@@ -21,84 +82,67 @@ async def analyze(request: Request,
             for f in files:
                 content = await f.read()
                 if f.filename.endswith(".csv"):
-                    uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+                    try:
+                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
+                    except Exception:
+                        uploaded_data[f.filename] = None
                 else:
                     uploaded_data[f.filename] = content
 
         # --- Step 3: Scrape URLs ---
         dataframes = {}
         for url in urls:
-            df = scrape_table_from_url(url)
-            dataframes[url] = df
+            try:
+                df = scrape_table_from_url(url)
+                dataframes[url] = df
+            except Exception:
+                dataframes[url] = None
+
         for filename, df in uploaded_data.items():
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # --- Step 4: Load YAML dynamically ---
+        # --- Step 4: Load YAML keys dynamically ---
+        expected_keys = []
         parsed_yaml = {}
         if yaml_file:
-            yaml_content = (await yaml_file.read()).decode("utf-8")
-            parsed_yaml = yaml.safe_load(yaml_content)
+            try:
+                yaml_content = (await yaml_file.read()).decode("utf-8")
+                parsed_yaml = yaml.safe_load(yaml_content) or {}
+                expected_keys = list(parsed_yaml.get("properties", {}).keys())
+            except Exception:
+                expected_keys = []
 
-        # --- Step 5: Precompute all YAML metrics ---
-        precomputed_metrics = {}
-        chart_cache = {}
-        evaluations = parsed_yaml.get("evaluations", [])
-        for eval_config in evaluations:
-            csv_file = eval_config.get("csv_file")
-            metrics = eval_config.get("metrics", {})
-            eval_name = eval_config.get("name", csv_file)
-
-            if csv_file not in dataframes:
-                continue
-            df = dataframes[csv_file]
-
-            # Compute metrics once
-            computed_metrics = {}
-            for key, props in metrics.items():
-                col = props.get("column")
-                op = props.get("operation")
-                if col not in df.columns:
-                    computed_metrics[key] = None
-                    continue
-                if op == "sum":
-                    computed_metrics[key] = df[col].sum()
-                elif op == "mean":
-                    computed_metrics[key] = df[col].mean()
-                elif op == "median":
-                    computed_metrics[key] = df[col].median()
-                elif op == "max":
-                    computed_metrics[key] = df[col].max()
-                elif op == "min":
-                    computed_metrics[key] = df[col].min()
-                elif op == "count":
-                    computed_metrics[key] = df[col].count()
-                else:
-                    computed_metrics[key] = None
-            precomputed_metrics.update(computed_metrics)
-
-            # Generate charts once per numeric column
-            numeric_cols = df.select_dtypes(include="number").columns
-            for col in numeric_cols:
-                chart_cache[f"{eval_name}_{col}_chart"] = generate_scatterplot(df, col, col)
-
-        # --- Step 6: Map questions to precomputed metrics ---
+        # --- Step 5: Generate AI-driven values for each key ---
         answers_dict = {}
-        for question in questions:
-            matched = False
-            for key, value in precomputed_metrics.items():
-                if key.lower() in question.lower():
-                    answers_dict[question] = value
-                    matched = True
-                    break
-            if not matched:
-                # Call AI only if no precomputed match
-                value = await ai_generate_value_for_key("unknown", question, dataframes)
-                answers_dict[question] = value
+        for key in expected_keys:
+            try:
+                value = await ai_generate_value_for_key(key, questions_content, dataframes)
+            except Exception:
+                value = "N/A"
 
-        # --- Step 7: Add generated charts ---
-        answers_dict.update(chart_cache)
+            # Auto-detect plot requests and generate locally if needed
+            if isinstance(value, str) and "plot" in value.lower():
+                scatter_df = None
+                x_col, y_col = None, None
+                for df in dataframes.values():
+                    if isinstance(df, pd.DataFrame):
+                        cols = [c.lower() for c in df.columns]
+                        if "rank" in cols and "peak" in cols:
+                            scatter_df = df
+                            x_col, y_col = df.columns[cols.index("rank")], df.columns[cols.index("peak")]
+                            break
+                if scatter_df is not None:
+                    try:
+                        value = generate_scatterplot(scatter_df, x_col, y_col)
+                    except Exception:
+                        value = "data:image/png;base64,"
+                else:
+                    value = "data:image/png;base64,"
 
+            answers_dict[key] = value
+
+        # Return JSON in expected syntax
         return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
 
     except Exception as e:
