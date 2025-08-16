@@ -34,9 +34,6 @@ def generate_scatterplot(df, x_col, y_col):
     return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
 
 async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
-    """
-    Sends the question + available data to AI to generate a value for a given key.
-    """
     data_preview = {k: (df.head(5).to_dict(orient="records") if isinstance(df, pd.DataFrame) else str(df))
                     for k, df in dataframes.items()}
     prompt = f"""
@@ -61,11 +58,6 @@ If the key requires a plot, suggest 'scatterplot' or another type of plot.
         return "N/A"
 
 def extract_keys_from_questions(txt):
-    """
-    Parses the questions text to extract all keys in backticks.
-    Example line: - `edge_count`: number
-    Returns a list of keys like ['edge_count', 'highest_degree_node', ...]
-    """
     pattern = r"- `([^`]+)`"
     return re.findall(pattern, txt)
 
@@ -84,6 +76,7 @@ async def analyze(request: Request,
         elif questions_txt:
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
 
+        # Extract questions and URLs
         questions, urls = parse_questions(questions_content)
 
         # --- Step 2: Process uploaded files ---
@@ -112,42 +105,36 @@ async def analyze(request: Request,
             if isinstance(df, pd.DataFrame):
                 dataframes[filename] = df
 
-        # --- Step 4: Extract keys directly from questions.txt ---
+        # --- Step 4: Extract keys from questions.txt ---
         expected_keys = extract_keys_from_questions(questions_content)
-
-        # Initialize dictionary with None or "N/A" for all keys
         answers_dict = {key: "N/A" for key in expected_keys}
 
-        # --- Step 5: Generate AI-driven values for each key ---
+        # --- Step 5: AI-driven values for each key ---
         for key in expected_keys:
-            try:
-                value = await ai_generate_value_for_key(key, questions_content, dataframes)
-            except Exception:
-                value = "N/A"
+            value = await ai_generate_value_for_key(key, questions_content, dataframes)
 
-            # Auto-detect plot requests and generate locally if needed
+            # Detect plot requests and auto-generate scatterplots
             if isinstance(value, str) and "plot" in value.lower():
-                scatter_df = None
-                x_col, y_col = None, None
+                scatter_done = False
                 for df in dataframes.values():
                     if isinstance(df, pd.DataFrame):
-                        cols = [c.lower() for c in df.columns]
-                        if "rank" in cols and "peak" in cols:
-                            scatter_df = df
-                            x_col, y_col = df.columns[cols.index("rank")], df.columns[cols.index("peak")]
+                        numeric_cols = df.select_dtypes(include="number").columns
+                        if len(numeric_cols) >= 2:
+                            value = generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
+                            scatter_done = True
                             break
-                if scatter_df is not None:
-                    try:
-                        value = generate_scatterplot(scatter_df, x_col, y_col)
-                    except Exception:
-                        value = "data:image/png;base64,"
-                else:
+                if not scatter_done:
                     value = "data:image/png;base64,"
 
             answers_dict[key] = value
 
-        # Return JSON in expected syntax
-        return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
+        # --- Step 6: Return response in promtfoo-compatible scheme ---
+        response_payload = {
+            "dict": answers_dict,
+            "array": [answers_dict[k] for k in expected_keys]
+        }
+
+        return JSONResponse(response_payload)
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
