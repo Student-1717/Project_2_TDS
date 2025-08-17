@@ -143,10 +143,11 @@ async def analyze(request: Request, questions_txt: UploadFile = File(None), file
             questions_text = (await questions_txt.read()).decode("utf-8")
             files_list = files
 
-        # Extract keys and questions
+        # ---------- Extract keys and questions ----------
         lines = [l.strip() for l in questions_text.splitlines() if l.strip()]
         keys, questions = [], []
         in_answer = False
+
         for line in lines:
             if line.lower().startswith("return a json object with keys:"):
                 continue
@@ -161,8 +162,15 @@ async def analyze(request: Request, questions_txt: UploadFile = File(None), file
                 k = line.strip("- ").split(":")[0].strip()
                 keys.append(k)
 
+        # Initialize output dictionary with default empty/zero values
+        answers_dict = {}
+        for k in keys:
+            # Set numeric-like keys to 0, otherwise empty string
+            answers_dict[k] = 0 if any(w in k.lower() for w in ["sales", "tax", "correlation", "median"]) else ""
+
         logger.info(f"Extracted keys: {keys}")
         logger.info(f"Extracted questions: {questions}")
+        logger.info(f"Initialized answers dict: {answers_dict}")
 
         # Load CSVs
         dfs = []
@@ -181,7 +189,7 @@ async def analyze(request: Request, questions_txt: UploadFile = File(None), file
         files_json = df_to_json(dfs)
 
         # Local computation
-        answers_dict, unanswered_keys, unanswered_qs = {}, [], []
+        unanswered_keys, unanswered_qs = [], []
         for key, q in zip(keys, questions):
             val = compute_local_value(key, q, dfs)
             if val == "N/A":
