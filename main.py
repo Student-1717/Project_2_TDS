@@ -10,20 +10,19 @@ from fastapi.responses import JSONResponse
 from typing import List, Optional
 from openai import OpenAI
 from util import scrape_table_from_url, parse_questions
+import logging
+import re
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TDS_API")
 
 app = FastAPI(title="TDS Data Analyst Agent")
-client = OpenAI()  # ensure OPENAI_API_KEY is set
+client = OpenAI()  # make sure OPENAI_API_KEY is set
 
-def dataframe_is_edge_list(df):
-    """Detect if a dataframe is an edge list for a graph"""
-    if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
-        # If at least 2 columns and all values are strings or ints
-        return all(df.iloc[:, 0].notna()) and all(df.iloc[:, 1].notna())
-    return False
-
-def generate_base64_plot(fig):
+def to_base64_plot(fig):
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=100)
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
@@ -34,130 +33,132 @@ def generate_scatterplot(df, x_col, y_col):
     df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
     df = df.dropna(subset=[x_col, y_col])
     if df.empty:
-        return ""
+        return "N/A"
     fig, ax = plt.subplots(figsize=(6, 4))
     sns.regplot(x=x_col, y=y_col, data=df, scatter=True, line_kws={"color": "red", "linestyle": "dotted"}, ax=ax)
     ax.set_xlabel(x_col)
     ax.set_ylabel(y_col)
     plt.tight_layout()
-    return generate_base64_plot(fig)
+    return to_base64_plot(fig)
 
-def generate_network_plots(G):
-    # Graph plot
-    fig1, ax1 = plt.subplots(figsize=(6, 4))
-    pos = nx.spring_layout(G)
-    nx.draw(G, pos, with_labels=True, node_color='skyblue', edge_color='gray', node_size=500, font_size=10, ax=ax1)
-    graph_img = generate_base64_plot(fig1)
-
-    # Degree histogram
-    degrees = [d for n, d in G.degree()]
-    fig2, ax2 = plt.subplots(figsize=(6, 4))
-    ax2.bar(range(len(degrees)), degrees, color='green')
-    ax2.set_xlabel('Node index')
-    ax2.set_ylabel('Degree')
+def generate_barplot(df, col):
+    counts = df[col].value_counts()
+    fig, ax = plt.subplots(figsize=(6, 4))
+    counts.plot(kind="bar", color="green", ax=ax)
+    ax.set_xlabel(col)
+    ax.set_ylabel("Count")
     plt.tight_layout()
-    hist_img = generate_base64_plot(fig2)
+    return to_base64_plot(fig)
 
-    return graph_img, hist_img
+def generate_network_plot(edges_df):
+    G = nx.from_pandas_edgelist(edges_df)
+    pos = nx.spring_layout(G)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    nx.draw(G, pos, with_labels=True, node_color="skyblue", edge_color="gray", ax=ax)
+    plt.tight_layout()
+    return to_base64_plot(fig), G
 
-def compute_local_value_dynamic(key, dataframes):
+def compute_local_value(key, dataframes):
     """
-    Fully dynamic local computation:
-    - Handles numeric, non-numeric, and graph-like CSVs
-    - Dynamically matches requested key
+    Compute values dynamically from uploaded CSVs/dataframes.
+    Handles numeric, non-numeric, and network data.
     """
     key_lower = key.lower()
-
     for df_name, df in dataframes.items():
-        if not isinstance(df, pd.DataFrame):
-            continue
-
-        # --- Detect graph automatically ---
-        if dataframe_is_edge_list(df):
-            G = nx.from_pandas_edgelist(df, df.columns[0], df.columns[1])
-            # Dynamically match key
-            if 'edge' in key_lower:
-                return G.number_of_edges()
-            if 'node' in key_lower and 'highest' in key_lower:
-                return max(dict(G.degree()).items(), key=lambda x: x[1])[0]
-            if 'degree' in key_lower and 'average' in key_lower:
-                return sum(dict(G.degree()).values()) / G.number_of_nodes()
-            if 'density' in key_lower:
-                return nx.density(G)
-            if 'shortest' in key_lower and len(key_lower.split('_')) >= 3:
-                # Try to parse node names from key like 'shortest_path_alice_eve'
-                parts = key_lower.split('_')
-                if len(parts) >= 3:
-                    source, target = parts[-2], parts[-1]
-                    if source in G.nodes and target in G.nodes:
-                        return nx.shortest_path_length(G, source, target)
+        if isinstance(df, pd.DataFrame):
+            # Numeric column exact match
+            for col in df.columns:
+                if col.lower() == key_lower:
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        return df[col].sum()
                     else:
-                        return "N/A"
-            if 'network_graph' in key_lower or 'graph' in key_lower:
-                graph_img, _ = generate_network_plots(G)
-                return graph_img
-            if 'degree_histogram' in key_lower or 'histogram' in key_lower:
-                _, hist_img = generate_network_plots(G)
-                return hist_img
+                        return df[col].astype(str).mode()[0]
 
-        # --- Numeric columns ---
-        col_matches = [col for col in df.columns if col.lower() == key_lower]
-        if col_matches:
-            col = col_matches[0]
-            if pd.api.types.is_numeric_dtype(df[col]):
-                return df[col].sum()
-            else:
-                return df[col].mode().iloc[0]  # fallback for non-numeric
+            # Aggregate numeric stats
+            if any(k in key_lower for k in ["sum", "total"]):
+                numeric_cols = df.select_dtypes(include="number").columns
+                if len(numeric_cols) > 0:
+                    return df[numeric_cols].sum().to_dict()
+            if any(k in key_lower for k in ["mean", "average"]):
+                numeric_cols = df.select_dtypes(include="number").columns
+                if len(numeric_cols) > 0:
+                    return df[numeric_cols].mean().to_dict()
 
-        # Partial matches for sums/means
-        if "sum" in key_lower or "total" in key_lower:
-            numeric_cols = df.select_dtypes(include="number").columns
-            if len(numeric_cols) > 0:
-                return df[numeric_cols].sum().to_dict()
-        if "mean" in key_lower or "average" in key_lower:
-            numeric_cols = df.select_dtypes(include="number").columns
-            if len(numeric_cols) > 0:
-                return df[numeric_cols].mean().to_dict()
+            # Scatterplot request
+            if "scatterplot" in key_lower or "plot" in key_lower:
+                numeric_cols = df.select_dtypes(include="number").columns
+                if len(numeric_cols) >= 2:
+                    return generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
 
-        # Scatterplot detection
-        if "scatterplot" in key_lower or "plot" in key_lower:
-            numeric_cols = df.select_dtypes(include="number").columns
-            if len(numeric_cols) >= 2:
-                return generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
+            # Network CSV (2-column edge list)
+            if df.shape[1] == 2:
+                plot_key = ["network_graph", "graph", "degree_histogram"]
+                if any(k in key_lower for k in plot_key):
+                    network_plot, G = generate_network_plot(df)
+                    if "degree_histogram" in key_lower:
+                        deg = pd.Series(dict(G.degree()))
+                        fig, ax = plt.subplots(figsize=(6, 4))
+                        deg.plot(kind="bar", color="green", ax=ax)
+                        plt.tight_layout()
+                        return to_base64_plot(fig)
+                    return network_plot
 
-        # Non-numeric columns: fallback to mode
-        non_numeric_cols = df.select_dtypes(exclude='number').columns
-        for col in non_numeric_cols:
-            if col.lower() == key_lower:
-                return df[col].mode().iloc[0]
+            # Non-numeric fallback: return first non-empty value
+            return df[df.columns[0]].astype(str).iloc[0]
 
-    return None  # fallback to AI
+    return None  # fallback to AI if not computable locally
 
-# --- /api/ endpoint ---
-import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TDS_API")
+async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
+    data_preview = {k: (df.head(5).to_dict(orient="records") if isinstance(df, pd.DataFrame) else str(df))
+                    for k, df in dataframes.items()}
+    prompt = f"""
+You are a data analyst AI.
+Key: "{key}"
+User Question: "{question}"
+Available dataframes (sample 5 rows each): {data_preview}
+Return a JSON with: {{"value": "computed_or_suggested_value"}}
+If the key requires a plot, suggest 'scatterplot' or another type of plot.
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        content = response.choices[0].message.content
+        result = json.loads(content)
+        return result.get("value", "N/A")
+    except Exception:
+        return "N/A"
+
+def extract_keys_from_questions(txt):
+    pattern = r"- `([^`]+)`"
+    return re.findall(pattern, txt)
 
 @app.post("/api/")
 async def analyze(request: Request,
                   questions_txt: Optional[UploadFile] = File(None),
                   files: Optional[List[UploadFile]] = None):
     try:
+        # --- Read request body safely once ---
+        body_bytes = await request.body()
+        body_str = body_bytes.decode("utf-8").strip()
+        try:
+            body_json = json.loads(body_str)
+        except json.JSONDecodeError:
+            body_json = {}
+
         # --- Read questions ---
         questions_content = ""
         if questions_txt:
             await questions_txt.seek(0)
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
-            logger.info(f"Questions file content length: {len(questions_content)}")
         else:
-            body = await request.json()
-            questions_content = body.get("request", "").strip()
-            logger.info(f"Questions from JSON length: {len(questions_content)}")
+            questions_content = body_json.get("request", "").strip()
 
         if not questions_content:
             logger.warning("No questions content provided!")
 
-        # --- Parse questions and URLs ---
+        # --- Parse questions ---
         questions, urls = parse_questions(questions_content)
         logger.info(f"Parsed questions: {questions}")
         logger.info(f"Parsed URLs: {urls}")
@@ -168,11 +169,10 @@ async def analyze(request: Request,
             for f in files:
                 await f.seek(0)
                 content = await f.read()
-                logger.info(f"Processing uploaded file: {f.filename}, size: {len(content)} bytes")
                 if f.filename.endswith(".csv"):
                     try:
                         uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
-                        logger.info(f"CSV loaded with shape: {uploaded_data[f.filename].shape}")
+                        logger.info(f"CSV loaded: {f.filename} with shape {uploaded_data[f.filename].shape}")
                     except Exception as e:
                         uploaded_data[f.filename] = None
                         logger.warning(f"Failed to read CSV {f.filename}: {e}")
@@ -185,7 +185,7 @@ async def analyze(request: Request,
             try:
                 df = scrape_table_from_url(url)
                 dataframes[url] = df
-                logger.info(f"Scraped URL {url} with shape: {df.shape}")
+                logger.info(f"Scraped URL {url} with shape {df.shape}")
             except Exception as e:
                 dataframes[url] = None
                 logger.warning(f"Failed to scrape URL {url}: {e}")
@@ -195,24 +195,20 @@ async def analyze(request: Request,
                 dataframes[filename] = df
 
         # --- Extract keys dynamically ---
-        import re
-        pattern = r"- `([^`]+)`"
-        expected_keys = re.findall(pattern, questions_content)
+        expected_keys = extract_keys_from_questions(questions_content)
         logger.info(f"Extracted keys: {expected_keys}")
-        if not expected_keys:
-            logger.warning("No keys extracted! Check question formatting (backticks `key`).")
-
         answers_dict = {key: "N/A" for key in expected_keys}
 
-        # --- Generate values for each key ---
+        # --- Compute values for each key ---
         for key in expected_keys:
-            local_val = compute_local_value_dynamic(key, dataframes)
+            local_val = compute_local_value(key, dataframes)
             if local_val is not None:
                 answers_dict[key] = local_val
                 logger.info(f"Local computation for '{key}': {local_val}")
             else:
-                # Fallback to AI if local computation fails
-                answers_dict[key] = "N/A"
+                ai_val = await ai_generate_value_for_key(key, questions_content, dataframes)
+                answers_dict[key] = ai_val
+                logger.info(f"AI computation for '{key}': {ai_val}")
 
         return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
 
