@@ -8,7 +8,7 @@ import json
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from openai import OpenAI, RateLimitError
 
@@ -167,10 +167,13 @@ def ask_ai_batch(keys, questions, files_json):
 # ---------- API Endpoint ----------
 
 @app.post("/api/")
-async def analyze(questions_txt: UploadFile = File(...), files: list[UploadFile] = File(default=[], alias="files[]")):
+async def analyze(request: Request):
     try:
-        # Read question file
-        questions_text = (await questions_txt.read()).decode("utf-8")
+        # Read JSON payload (Promptfoo sends JSON)
+        data = await request.json()
+
+        # Questions parsing
+        questions_text = data.get("questions_txt", "")
         lines = [l.strip() for l in questions_text.splitlines() if l.strip()]
         keys = []
         questions = []
@@ -192,11 +195,11 @@ async def analyze(questions_txt: UploadFile = File(...), files: list[UploadFile]
         logger.info(f"Extracted keys: {keys}")
         logger.info(f"Extracted questions: {questions}")
 
-        # Load CSVs
+        # Load CSVs from JSON
         dfs = []
-        for f in files:
-            if f.filename.endswith(".csv"):
-                content = await f.read()
+        for f in data.get("files", []):
+            if f["filename"].endswith(".csv"):
+                content = base64.b64decode(f["content"])
                 df = pd.read_csv(io.BytesIO(content))
                 dfs.append(df)
 
