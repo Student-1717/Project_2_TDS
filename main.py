@@ -8,27 +8,22 @@ import json
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from openai import OpenAI, RateLimitError
 
-logging.basicConfig(level=logging.DEBUG)  # DEBUG level to capture everything
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("main")
 
 app = FastAPI()
-
-# OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# cooldown tracker
 last_ai_call = 0
 AI_COOLDOWN = 3  # seconds
-
 
 # ---------- Helpers ----------
 
 def sanitize_for_json(obj):
-    """Recursively replace NaN/None/Inf with 'N/A'."""
     if isinstance(obj, dict):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -41,29 +36,19 @@ def sanitize_for_json(obj):
         return "N/A"
     return obj
 
-
 def df_to_json(dfs):
-    """Convert multiple DataFrames to JSON dict."""
     return {f"file_{i}": df.to_dict(orient="records") for i, df in enumerate(dfs)}
 
-
 def make_chart(fig):
-    """Convert matplotlib figure to base64 string."""
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("utf-8")
-    return b64
-
+    return base64.b64encode(buf.read()).decode("utf-8")
 
 # ---------- Local Compute ----------
 
 def compute_local_value(key, question, dfs):
-    """
-    Dynamically attempt to compute local answers based on keywords.
-    No hardcoded column names. Debug shows column choices.
-    """
     try:
         df = dfs[0] if dfs else None
         if df is None or df.empty:
@@ -71,51 +56,32 @@ def compute_local_value(key, question, dfs):
             return "N/A"
 
         text = (key + " " + question).lower()
-
-        # detect numeric and categorical columns
         numeric_cols = df.select_dtypes(include="number").columns.tolist()
         categorical_cols = df.select_dtypes(exclude="number").columns.tolist()
-
         logger.debug(f"[{key}] Numeric cols: {numeric_cols}, Categorical cols: {categorical_cols}")
-
         if not numeric_cols:
             return "N/A"
 
-        num_col = numeric_cols[0]  # pick first numeric
+        num_col = numeric_cols[0]
         logger.debug(f"[{key}] Using numeric column '{num_col}'")
 
-        # SUM / TOTAL
         if "total" in text or "sum" in text:
             return float(df[num_col].sum())
-
-        # MEAN / AVERAGE
         if "average" in text or "mean" in text:
             return float(df[num_col].mean())
-
-        # MEDIAN
         if "median" in text:
             return float(df[num_col].median())
-
-        # MAX / TOP
         if any(w in text for w in ["max", "highest", "top"]):
             return float(df[num_col].max())
-
-        # MIN / LOWEST
         if any(w in text for w in ["min", "lowest", "bottom"]):
             return float(df[num_col].min())
-
-        # CORRELATION with date/day
         if "correlation" in text and "date" in df.columns:
             df["day"] = pd.to_datetime(df["date"]).dt.day
             return float(df["day"].corr(df[num_col]))
-
-        # BAR CHART
         if "bar" in text and categorical_cols:
             fig, ax = plt.subplots()
             df.groupby(categorical_cols[0])[num_col].sum().plot(kind="bar", ax=ax)
             return make_chart(fig)
-
-        # CUMULATIVE LINE CHART
         if "cumulative" in text and "chart" in text:
             df_sorted = df.sort_values("date") if "date" in df.columns else df.copy()
             df_sorted["cumulative_val"] = df_sorted[num_col].cumsum()
@@ -129,7 +95,6 @@ def compute_local_value(key, question, dfs):
         logger.warning(f"Local compute failed for {key}: {e}")
         return "N/A"
 
-
 # ---------- AI Fallback ----------
 
 def safe_ai_call(fn, *args, **kwargs):
@@ -141,9 +106,7 @@ def safe_ai_call(fn, *args, **kwargs):
     last_ai_call = now
     return fn(*args, **kwargs)
 
-
 def ask_ai_batch(keys, questions, files_json):
-    """Ask AI once for all unanswered questions."""
     try:
         q_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
         resp = client.chat.completions.create(
@@ -163,20 +126,26 @@ def ask_ai_batch(keys, questions, files_json):
         logger.error(f"AI fallback failed: {e}")
         return None
 
-
 # ---------- API Endpoint ----------
 
 @app.post("/api/")
-async def analyze(request: Request):
+async def analyze(request: Request, questions_txt: UploadFile = File(None), files: list[UploadFile] = File(default=[], alias="files[]")):
     try:
-        # Read JSON payload (Promptfoo sends JSON)
-        data = await request.json()
+        # Detect if JSON body or file upload
+        if questions_txt is None:
+            try:
+                body = await request.json()
+                questions_text = body.get("questions_txt", "")
+                files_list = body.get("files", [])
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON input"}, status_code=400)
+        else:
+            questions_text = (await questions_txt.read()).decode("utf-8")
+            files_list = files
 
-        # Questions parsing
-        questions_text = data.get("questions_txt", "")
+        # Extract keys and questions
         lines = [l.strip() for l in questions_text.splitlines() if l.strip()]
-        keys = []
-        questions = []
+        keys, questions = [], []
         in_answer = False
         for line in lines:
             if line.lower().startswith("return a json object with keys:"):
@@ -195,21 +164,24 @@ async def analyze(request: Request):
         logger.info(f"Extracted keys: {keys}")
         logger.info(f"Extracted questions: {questions}")
 
-        # Load CSVs from JSON
+        # Load CSVs
         dfs = []
-        for f in data.get("files", []):
-            if f["filename"].endswith(".csv"):
-                content = base64.b64decode(f["content"])
-                df = pd.read_csv(io.BytesIO(content))
+        for f in files_list:
+            if isinstance(f, dict):
+                # JSON input: assume dict contains CSV content as string
+                df = pd.read_csv(io.StringIO(f.get("content", "")))
                 dfs.append(df)
+            else:
+                # UploadFile
+                if f.filename.endswith(".csv"):
+                    content = await f.read()
+                    df = pd.read_csv(io.BytesIO(content))
+                    dfs.append(df)
 
         files_json = df_to_json(dfs)
 
-        # Try local answers
-        answers_dict = {}
-        unanswered_keys = []
-        unanswered_qs = []
-
+        # Local computation
+        answers_dict, unanswered_keys, unanswered_qs = {}, [], []
         for key, q in zip(keys, questions):
             val = compute_local_value(key, q, dfs)
             if val == "N/A":
@@ -217,7 +189,7 @@ async def analyze(request: Request):
                 unanswered_qs.append(q)
             answers_dict[key] = val
 
-        # AI fallback in batch
+        # AI fallback
         if unanswered_keys:
             ai_raw = safe_ai_call(ask_ai_batch, unanswered_keys, unanswered_qs, files_json)
             if ai_raw:
@@ -228,12 +200,10 @@ async def analyze(request: Request):
                 except Exception as e:
                     logger.error(f"Failed to parse AI JSON: {e}")
 
-        # Debug expected vs returned keys
         returned_keys = list(answers_dict.keys())
         if set(keys) != set(returned_keys):
             logger.warning(f"⚠️ Key mismatch!\nExpected: {keys}\nReturned: {returned_keys}")
 
-        # Final result
         result = sanitize_for_json(answers_dict)
         return JSONResponse(result)
 
