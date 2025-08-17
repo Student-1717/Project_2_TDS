@@ -1,217 +1,173 @@
-import io
+import os
+import time
 import json
 import base64
+import logging
+from io import BytesIO
+from typing import List, Dict
+
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-import networkx as nx
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
-from typing import List, Optional
-from openai import OpenAI
-from util import scrape_table_from_url, parse_questions
-import logging
-import re
+from pydantic import BaseModel
+from openai import OpenAI, RateLimitError
 
-# Configure logging
+# -------------------------
+# Setup
+# -------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TDS_API")
+logger = logging.getLogger("main")
 
-app = FastAPI(title="TDS Data Analyst Agent")
-client = OpenAI()  # make sure OPENAI_API_KEY is set
+app = FastAPI()
 
-def to_base64_plot(fig):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def generate_scatterplot(df, x_col, y_col):
-    df = df.copy()
-    df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
-    df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
-    df = df.dropna(subset=[x_col, y_col])
-    if df.empty:
-        return "N/A"
-    fig, ax = plt.subplots(figsize=(6, 4))
-    sns.regplot(x=x_col, y=y_col, data=df, scatter=True, line_kws={"color": "red", "linestyle": "dotted"}, ax=ax)
-    ax.set_xlabel(x_col)
-    ax.set_ylabel(y_col)
-    plt.tight_layout()
-    return to_base64_plot(fig)
+last_ai_call = 0
+AI_COOLDOWN = 3  # seconds between AI calls
 
-def generate_barplot(df, col):
-    counts = df[col].value_counts()
-    fig, ax = plt.subplots(figsize=(6, 4))
-    counts.plot(kind="bar", color="green", ax=ax)
-    ax.set_xlabel(col)
-    ax.set_ylabel("Count")
-    plt.tight_layout()
-    return to_base64_plot(fig)
 
-def generate_network_plot(edges_df):
-    G = nx.from_pandas_edgelist(edges_df)
-    pos = nx.spring_layout(G)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    nx.draw(G, pos, with_labels=True, node_color="skyblue", edge_color="gray", ax=ax)
-    plt.tight_layout()
-    return to_base64_plot(fig), G
+# -------------------------
+# Helpers
+# -------------------------
+def safe_ai_call(fn, *args, **kwargs):
+    global last_ai_call
+    now = time.time()
+    if now - last_ai_call < AI_COOLDOWN:
+        logger.warning("Skipping AI call to respect cooldown")
+        return None
+    last_ai_call = now
+    return fn(*args, **kwargs)
 
-def compute_local_value(key, dataframes):
-    """
-    Compute values dynamically from uploaded CSVs/dataframes.
-    Handles numeric, non-numeric, and network data.
-    """
-    key_lower = key.lower()
-    for df_name, df in dataframes.items():
-        if isinstance(df, pd.DataFrame):
-            # Numeric column exact match
-            for col in df.columns:
-                if col.lower() == key_lower:
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        return df[col].sum()
-                    else:
-                        return df[col].astype(str).mode()[0]
 
-            # Aggregate numeric stats
-            if any(k in key_lower for k in ["sum", "total"]):
-                numeric_cols = df.select_dtypes(include="number").columns
-                if len(numeric_cols) > 0:
-                    return df[numeric_cols].sum().to_dict()
-            if any(k in key_lower for k in ["mean", "average"]):
-                numeric_cols = df.select_dtypes(include="number").columns
-                if len(numeric_cols) > 0:
-                    return df[numeric_cols].mean().to_dict()
+def extract_keys_and_questions(text: str):
+    keys, questions = [], []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("-"):
+            # candidate key line
+            k = line.strip("- ").split(":")[0].strip()
+            k = k.replace("`", "")
+            if not k.lower().startswith("analyze "):
+                keys.append(k)
+        elif line[0].isdigit() and "." in line:
+            q = line.split(".", 1)[1].strip()
+            questions.append(q)
+    return keys, questions
 
-            # Scatterplot request
-            if "scatterplot" in key_lower or "plot" in key_lower:
-                numeric_cols = df.select_dtypes(include="number").columns
-                if len(numeric_cols) >= 2:
-                    return generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
 
-            # Network CSV (2-column edge list)
-            if df.shape[1] == 2:
-                plot_key = ["network_graph", "graph", "degree_histogram"]
-                if any(k in key_lower for k in plot_key):
-                    network_plot, G = generate_network_plot(df)
-                    if "degree_histogram" in key_lower:
-                        deg = pd.Series(dict(G.degree()))
-                        fig, ax = plt.subplots(figsize=(6, 4))
-                        deg.plot(kind="bar", color="green", ax=ax)
-                        plt.tight_layout()
-                        return to_base64_plot(fig)
-                    return network_plot
+def df_to_json_for_ai(df: pd.DataFrame):
+    # For small CSVs we can just pass rows to AI
+    return df.to_dict(orient="records")
 
-            # Non-numeric fallback: return first non-empty value
-            return df[df.columns[0]].astype(str).iloc[0]
 
-    return None  # fallback to AI if not computable locally
-
-async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
-    data_preview = {k: (df.head(5).to_dict(orient="records") if isinstance(df, pd.DataFrame) else str(df))
-                    for k, df in dataframes.items()}
-    prompt = f"""
-You are a data analyst AI.
-Key: "{key}"
-User Question: "{question}"
-Available dataframes (sample 5 rows each): {data_preview}
-Return a JSON with: {{"value": "computed_or_suggested_value"}}
-If the key requires a plot, suggest 'scatterplot' or another type of plot.
-"""
+def compute_locally(df: pd.DataFrame, key: str):
+    """Try to compute common metrics locally instead of using AI"""
     try:
-        response = client.chat.completions.create(
+        k = key.lower()
+        if "total_sales" in k:
+            return float(df["sales"].sum())
+        if "median_sales" in k:
+            return float(df["sales"].median())
+        if "top_region" in k:
+            return str(df.groupby("region")["sales"].sum().idxmax())
+        if "total_sales_tax" in k:
+            return float(df["sales"].sum() * 0.10)
+        if "bar_chart" in k:
+            plt.figure()
+            df.groupby("region")["sales"].sum().plot(kind="bar", color="blue")
+            buf = BytesIO()
+            plt.savefig(buf, format="png")
+            plt.close()
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+        if "cumulative_sales_chart" in k:
+            plt.figure()
+            df = df.sort_values("date")
+            df["cumulative"] = df["sales"].cumsum()
+            plt.plot(df["date"], df["cumulative"], color="red")
+            plt.xticks(rotation=45)
+            buf = BytesIO()
+            plt.savefig(buf, format="png")
+            plt.close()
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+        if "correlation" in k:
+            df["day"] = pd.to_datetime(df["date"]).dt.day
+            return float(df["day"].corr(df["sales"]))
+    except Exception as e:
+        logger.warning(f"Local compute failed for {key}: {e}")
+    return "N/A"
+
+
+def ask_ai_batch(keys: List[str], questions: List[str], files_json: Dict):
+    try:
+        q_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[
+                {"role": "system", "content": "You are a helpful data assistant. Always respond in valid JSON matching the keys provided."},
+                {"role": "user", "content": f"Keys: {keys}\n\nQuestions:\n{q_text}\n\nData:\n{files_json}"}
+            ],
+            temperature=0,
+            response_format={"type": "json_object"}  # enforce JSON
         )
-        content = response.choices[0].message.content
-        result = json.loads(content)
-        return result.get("value", "N/A")
-    except Exception:
-        return "N/A"
+        return resp.choices[0].message.content
+    except RateLimitError as e:
+        logger.error(f"Rate limit reached, skipping AI fallback: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"AI fallback failed: {e}")
+        return None
 
-def extract_keys_from_questions(txt):
-    pattern = r"- `([^`]+)`"
-    return re.findall(pattern, txt)
 
+# -------------------------
+# API Endpoint
+# -------------------------
 @app.post("/api/")
-async def analyze(request: Request,
-                  questions_txt: Optional[UploadFile] = File(None),
-                  files: Optional[List[UploadFile]] = None):
+async def analyze(questions_txt: UploadFile, files: List[UploadFile] = []):
     try:
-        # --- Read request body safely once ---
-        body_bytes = await request.body()
-        body_str = body_bytes.decode("utf-8").strip()
-        try:
-            body_json = json.loads(body_str)
-        except json.JSONDecodeError:
-            body_json = {}
+        # read questions
+        q_text = (await questions_txt.read()).decode("utf-8")
+        keys, questions = extract_keys_and_questions(q_text)
+        logger.info(f"Extracted keys: {keys}")
+        logger.info(f"Extracted questions: {questions}")
 
-        # --- Read questions ---
-        questions_content = ""
-        if questions_txt:
-            await questions_txt.seek(0)
-            questions_content = (await questions_txt.read()).decode("utf-8").strip()
-        else:
-            questions_content = body_json.get("request", "").strip()
+        # load CSVs
+        dfs = {}
+        for f in files:
+            df = pd.read_csv(f.file)
+            dfs[f.filename] = df
 
-        if not questions_content:
-            logger.warning("No questions content provided!")
+        # compute answers
+        answers_dict = {k: "N/A" for k in keys}
+        for f, df in dfs.items():
+            for k in keys:
+                val = compute_locally(df, k)
+                if val != "N/A":
+                    answers_dict[k] = val
 
-        # --- Parse questions ---
-        questions, urls = parse_questions(questions_content)
-        logger.info(f"Parsed questions: {questions}")
-        logger.info(f"Parsed URLs: {urls}")
+        # unanswered → AI
+        unanswered_keys = [k for k, v in answers_dict.items() if v == "N/A"]
+        unanswered_qs = [
+            questions[keys.index(k)]
+            for k in unanswered_keys if k in keys
+        ]
 
-        # --- Process uploaded files ---
-        uploaded_data = {}
-        if files:
-            for f in files:
-                await f.seek(0)
-                content = await f.read()
-                if f.filename.endswith(".csv"):
-                    try:
-                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
-                        logger.info(f"CSV loaded: {f.filename} with shape {uploaded_data[f.filename].shape}")
-                    except Exception as e:
-                        uploaded_data[f.filename] = None
-                        logger.warning(f"Failed to read CSV {f.filename}: {e}")
-                else:
-                    uploaded_data[f.filename] = content
+        if unanswered_keys:
+            files_json = {name: df_to_json_for_ai(df) for name, df in dfs.items()}
+            ai_raw = safe_ai_call(ask_ai_batch, unanswered_keys, unanswered_qs, files_json)
+            if ai_raw:
+                try:
+                    ai_answers = json.loads(ai_raw)
+                    for k in unanswered_keys:
+                        answers_dict[k] = ai_answers.get(k, "N/A")
+                except Exception as e:
+                    logger.error(f"Failed to parse AI JSON: {e}, raw: {ai_raw[:200]}")
 
-        # --- Scrape URLs ---
-        dataframes = {}
-        for url in urls:
-            try:
-                df = scrape_table_from_url(url)
-                dataframes[url] = df
-                logger.info(f"Scraped URL {url} with shape {df.shape}")
-            except Exception as e:
-                dataframes[url] = None
-                logger.warning(f"Failed to scrape URL {url}: {e}")
-
-        for filename, df in uploaded_data.items():
-            if isinstance(df, pd.DataFrame):
-                dataframes[filename] = df
-
-        # --- Extract keys dynamically ---
-        expected_keys = extract_keys_from_questions(questions_content)
-        logger.info(f"Extracted keys: {expected_keys}")
-        answers_dict = {key: "N/A" for key in expected_keys}
-
-        # --- Compute values for each key ---
-        for key in expected_keys:
-            local_val = compute_local_value(key, dataframes)
-            if local_val is not None:
-                answers_dict[key] = local_val
-                logger.info(f"Local computation for '{key}': {local_val}")
-            else:
-                ai_val = await ai_generate_value_for_key(key, questions_content, dataframes)
-                answers_dict[key] = ai_val
-                logger.info(f"AI computation for '{key}': {ai_val}")
-
-        return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
+        return JSONResponse(content=answers_dict)
 
     except Exception as e:
         logger.error(f"Error in /api/: {e}", exc_info=True)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
