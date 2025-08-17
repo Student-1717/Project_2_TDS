@@ -167,7 +167,7 @@ def ask_ai_batch(keys, questions, files_json):
 # ---------- API Endpoint ----------
 
 @app.post("/api/")
-async def analyze(questions_txt: UploadFile = File(...), files: list[UploadFile] = File(default=[])):
+async def analyze(questions_txt: UploadFile = File(...), files: list[UploadFile] = File(default=[], alias="files[]")):
     try:
         # Read question file
         questions_text = (await questions_txt.read()).decode("utf-8")
