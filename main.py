@@ -4,26 +4,36 @@ import base64
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import networkx as nx
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from typing import List, Optional
-from openai import OpenAI
-from util import scrape_table_from_url, parse_questions
+from util import parse_questions
 
 app = FastAPI(title="TDS Data Analyst Agent")
-client = OpenAI()  # make sure OPENAI_API_KEY is set
 
-def generate_scatterplot(df, x_col, y_col):
-    df = df.copy()
-    df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
-    df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
-    df = df.dropna(subset=[x_col, y_col])
-    if df.empty:
-        return "data:image/png;base64,"
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TDS_API")
+
+
+def generate_network_plot(G):
     plt.figure(figsize=(6, 4))
-    sns.regplot(x=x_col, y=y_col, data=df, scatter=True, line_kws={"color": "red", "linestyle": "dotted"})
-    plt.xlabel(x_col)
-    plt.ylabel(y_col)
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_color='skyblue', edge_color='gray', node_size=500)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=100, bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
+
+
+def generate_degree_histogram(G):
+    degrees = [d for n, d in G.degree()]
+    plt.figure(figsize=(6, 4))
+    sns.barplot(x=list(range(len(degrees))), y=degrees, color='green')
+    plt.xlabel("Node index")
+    plt.ylabel("Degree")
     plt.tight_layout()
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=100)
@@ -31,79 +41,35 @@ def generate_scatterplot(df, x_col, y_col):
     buf.seek(0)
     return f"data:image/png;base64,{base64.b64encode(buf.read()).decode('utf-8')}"
 
-def compute_local_value(key, dataframes):
-    """
-    Enhanced local computations for CSVs.
-    Handles numeric sums, means, and scatterplots automatically.
-    """
-    key_lower = key.lower()
-    for df in dataframes.values():
-        if isinstance(df, pd.DataFrame):
-            # Exact column match (case-insensitive)
-            col_matches = [col for col in df.columns if col.lower() == key_lower]
-            if col_matches:
-                col = col_matches[0]
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    return df[col].sum()
-                else:
-                    return "N/A"
-            
-            # Partial match for aggregate stats
-            if "sum" in key_lower or "total" in key_lower:
-                numeric_cols = df.select_dtypes(include="number").columns
-                if numeric_cols.any():
-                    return df[numeric_cols].sum().to_dict()
-            if "mean" in key_lower or "average" in key_lower:
-                numeric_cols = df.select_dtypes(include="number").columns
-                if numeric_cols.any():
-                    return df[numeric_cols].mean().to_dict()
-            
-            # Check for plot request
-            if "scatterplot" in key_lower or "plot" in key_lower:
-                numeric_cols = df.select_dtypes(include="number").columns
-                if len(numeric_cols) >= 2:
-                    return generate_scatterplot(df, numeric_cols[0], numeric_cols[1])
-    return None  # fallback to AI
 
-async def ai_generate_value_for_key(key: str, question: str, dataframes: dict):
-    """
-    Sends the question + available data to AI to generate a value for a given key.
-    """
-    data_preview = {k: (df.head(5).to_dict(orient="records") if isinstance(df, pd.DataFrame) else str(df))
-                    for k, df in dataframes.items()}
-    prompt = f"""
-You are a data analyst AI.
-Key: "{key}"
-User Question: "{question}"
-Available dataframes (sample 5 rows each): {data_preview}
-Return a JSON with: {{"value": "computed_or_suggested_value"}}
-If the key requires a plot, suggest 'scatterplot' or another type of plot.
-"""
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        content = response.choices[0].message.content
-        result = json.loads(content)
-        return result.get("value", "N/A")
-    except Exception:
-        return "N/A"
+def compute_graph_metrics(df):
+    G = nx.from_pandas_edgelist(df, source='source', target='target')
+    metrics = {
+        "edge_count": G.number_of_edges(),
+        "highest_degree_node": max(G.degree, key=lambda x: x[1])[0],
+        "average_degree": sum(dict(G.degree()).values()) / G.number_of_nodes(),
+        "density": nx.density(G)
+    }
+    # Optional: compute shortest path between Alice and Eve if nodes exist
+    if "Alice" in G and "Eve" in G:
+        try:
+            metrics["shortest_path_alice_eve"] = nx.shortest_path_length(G, "Alice", "Eve")
+        except nx.NetworkXNoPath:
+            metrics["shortest_path_alice_eve"] = None
+    else:
+        metrics["shortest_path_alice_eve"] = None
+
+    # Generate plots
+    metrics["network_graph"] = generate_network_plot(G)
+    metrics["degree_histogram"] = generate_degree_histogram(G)
+    return metrics
+
 
 def extract_keys_from_questions(txt):
-    """
-    Extract all keys from questions YAML or text.
-    Keys are enclosed in backticks, e.g. - `key_name`: description
-    """
     import re
     pattern = r"- `([^`]+)`"
     return re.findall(pattern, txt)
 
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TDS_API")
 
 @app.post("/api/")
 async def analyze(request: Request,
@@ -116,21 +82,13 @@ async def analyze(request: Request,
             await questions_txt.seek(0)
             questions_content = (await questions_txt.read()).decode("utf-8").strip()
             logger.info(f"Questions file content length: {len(questions_content)}")
-        elif request.headers.get("content-type", "").startswith("application/json"):
-            # Only try to read JSON if no file is uploaded
+        else:
             body = await request.json()
             questions_content = body.get("request", "").strip()
             logger.info(f"Questions from JSON length: {len(questions_content)}")
-        else:
-            logger.warning("No questions content provided!")
 
-        # --- Step 2: Parse questions and URLs ---
-        questions, urls = parse_questions(questions_content)
-        logger.info(f"Parsed questions: {questions}")
-        logger.info(f"Parsed URLs: {urls}")
-
-        # --- Step 3: Process uploaded files ---
-        uploaded_data = {}
+        # --- Step 2: Process uploaded files ---
+        dataframes = {}
         if files:
             for f in files:
                 await f.seek(0)
@@ -138,48 +96,26 @@ async def analyze(request: Request,
                 logger.info(f"Processing uploaded file: {f.filename}, size: {len(content)} bytes")
                 if f.filename.endswith(".csv"):
                     try:
-                        uploaded_data[f.filename] = pd.read_csv(io.BytesIO(content))
-                        logger.info(f"CSV loaded with shape: {uploaded_data[f.filename].shape}")
+                        dataframes[f.filename] = pd.read_csv(io.BytesIO(content))
+                        logger.info(f"CSV loaded with shape: {dataframes[f.filename].shape}")
                     except Exception as e:
-                        uploaded_data[f.filename] = None
+                        dataframes[f.filename] = None
                         logger.warning(f"Failed to read CSV {f.filename}: {e}")
                 else:
-                    uploaded_data[f.filename] = content
+                    dataframes[f.filename] = content
 
-        # --- Step 4: Scrape URLs ---
-        dataframes = {}
-        for url in urls:
-            try:
-                df = scrape_table_from_url(url)
-                dataframes[url] = df
-                logger.info(f"Scraped URL {url} with shape: {df.shape}")
-            except Exception as e:
-                dataframes[url] = None
-                logger.warning(f"Failed to scrape URL {url}: {e}")
-
-        # Merge uploaded CSVs
-        for filename, df in uploaded_data.items():
-            if isinstance(df, pd.DataFrame):
-                dataframes[filename] = df
-
-        # --- Step 5: Extract keys dynamically ---
+        # --- Step 3: Extract keys ---
         expected_keys = extract_keys_from_questions(questions_content)
         logger.info(f"Extracted keys: {expected_keys}")
-        if not expected_keys:
-            logger.warning("No keys extracted! Check question formatting (backticks `key`).")
 
         answers_dict = {key: "N/A" for key in expected_keys}
 
-        # --- Step 6: Generate values for each key ---
-        for key in expected_keys:
-            local_val = compute_local_value(key, dataframes)
-            if local_val is not None:
-                answers_dict[key] = local_val
-                logger.info(f"Local computation for '{key}': {local_val}")
-            else:
-                ai_val = await ai_generate_value_for_key(key, questions_content, dataframes)
-                answers_dict[key] = ai_val
-                logger.info(f"AI computation for '{key}': {ai_val}")
+        # --- Step 4: Compute graph metrics if edges.csv is present ---
+        if "edges.csv" in dataframes and isinstance(dataframes["edges.csv"], pd.DataFrame):
+            metrics = compute_graph_metrics(dataframes["edges.csv"])
+            for key in expected_keys:
+                if key in metrics:
+                    answers_dict[key] = metrics[key]
 
         return JSONResponse({"dict": answers_dict, "array": list(answers_dict.values())})
 
